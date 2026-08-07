@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="scroll-smooth">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>doubao2api — 免费多模态 AI API for Agents</title>
+<meta name="description" content="逆向豆包(Doubao)客户端 API，为 AI 智能体提供免费的多模态对话、图片/视频/音乐生成、文件上传。OpenAI 兼容接口，即插即用。">
+<meta name="keywords" content="doubao, 豆包, API, OpenAI, 逆向, AI Agent, 多模态, 免费, 文生图, 文生视频, 文生音乐, Python, FastAPI, bytedance, 字节跳动">
+<meta property="og:title" content="doubao2api — 免费多模态 AI API for Agents">
+<meta property="og:description" content="逆向豆包客户端 API，为 AI 智能体提供免费多模态能力。支持对话、识图、文件理解、图片/视频/音乐生成。OpenAI 兼容。">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://wangchuxiaoji-oss.github.io/doubao2api">
+<!-- Fonts: Noto Sans SC (Heavy) for headings, Noto Serif SC for body, JetBrains Mono for code -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@700;900&family=Noto+Serif+SC:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        surface: { 950: '#09090b', 900: '#0f0f12', 800: '#18181b', 700: '#27272a' },
+        amber: { 400: '#fbbf24', 500: '#f59e0b', 600: '#d97706' },
+        gold: { DEFAULT: '#d4a853', light: '#f0d78c', dark: '#a67c2e' }
+      },
+      fontFamily: {
+        display: ['"Noto Sans SC"', 'sans-serif'],
+        body: ['"Noto Serif SC"', 'serif'],
+        mono: ['"JetBrains Mono"', 'monospace']
+      }
+    }
+  }
+}
+</script>
+<style>
+:root {
+  --gold: #d4a853;
+  --gold-light: #f0d78c;
+  --gold-dark: #a67c2e;
+  --surface-950: #09090b;
+  --surface-900: #0f0f12;
+  --glow-amber: rgba(251,191,36,0.15);
+}
+* { box-sizing: border-box; }
+body { font-family: 'Noto Serif SC', serif; background: var(--surface-950); color: #e4e4e7; }
+h1,h2,h3,h4,h5,h6 { font-family: 'Noto Sans SC', sans-serif; }
+code, pre { font-family: 'JetBrains Mono', monospace; }
+
+/* Gradient text */
+.text-gradient-gold {
+  background: linear-gradient(135deg, var(--gold-light) 0%, var(--gold) 50%, var(--gold-dark) 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+
+/* Glow orbs (Linear-style) */
+.glow-orb {
+  position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.4; pointer-events: none;
+}
+.glow-orb-1 { width: 600px; height: 600px; background: rgba(212,168,83,0.3); top: -200px; left: -100px; }
+.glow-orb-2 { width: 400px; height: 400px; background: rgba(251,191,36,0.2); top: 300px; right: -150px; }
+
+/* Scroll reveal */
+.reveal { opacity: 0; transform: translateY(40px); transition: opacity 0.8s cubic-bezier(.16,1,.3,1), transform 0.8s cubic-bezier(.16,1,.3,1); }
+.reveal.visible { opacity: 1; transform: translateY(0); }
+.reveal-delay-1 { transition-delay: 0.1s; }
+.reveal-delay-2 { transition-delay: 0.2s; }
+.reveal-delay-3 { transition-delay: 0.3s; }
+.reveal-delay-4 { transition-delay: 0.4s; }
+.reveal-delay-5 { transition-delay: 0.5s; }
+
+/* Code block styling */
+.code-block { background: #141417; border: 1px solid #27272a; border-radius: 12px; overflow: hidden; }
+.code-block pre { padding: 1.5rem; margin: 0; font-size: 0.85rem; line-height: 1.7; overflow-x: auto; }
+.code-header { padding: 0.75rem 1.5rem; border-bottom: 1px solid #27272a; font-size: 0.75rem; color: #71717a; display: flex; align-items: center; gap: 0.5rem; }
+.code-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+/* Card hover */
+.card-glass {
+  background: rgba(24,24,27,0.6); backdrop-filter: blur(12px); border: 1px solid #27272a;
+  border-radius: 16px; transition: transform 0.3s, border-color 0.3s, box-shadow 0.3s;
+}
+.card-glass:hover { transform: translateY(-4px); border-color: var(--gold); box-shadow: 0 20px 60px rgba(212,168,83,0.08); }
+
+/* Typing cursor */
+@keyframes blink { 0%,50% { opacity: 1; } 51%,100% { opacity: 0; } }
+.typing-cursor::after { content: '▊'; animation: blink 1s infinite; color: var(--gold); margin-left: 2px; }
+
+/* FAQ accordion */
+.faq-answer { max-height: 0; overflow: hidden; transition: max-height 0.4s ease; }
+.faq-item.open .faq-answer { max-height: 200px; }
+.faq-item.open .faq-chevron { transform: rotate(180deg); }
+.faq-chevron { transition: transform 0.3s; }
+</style>
+</head>
+<body class="antialiased overflow-x-hidden">
+
+<!-- ═══════════ HERO ═══════════ -->
+<section class="relative min-h-screen flex items-center justify-center px-6 py-24 overflow-hidden">
+  <div class="glow-orb glow-orb-1"></div>
+  <div class="glow-orb glow-orb-2"></div>
+  <div class="relative z-10 max-w-5xl mx-auto">
+    <!-- Overline -->
+    <p class="reveal text-sm tracking-[0.3em] uppercase text-zinc-500 mb-6 font-mono">开源 · 免费 · OpenAI 兼容</p>
+    <!-- Main title — magazine-style large type -->
+    <h1 class="reveal reveal-delay-1 text-5xl md:text-7xl lg:text-8xl font-display font-black leading-[0.95] tracking-tight mb-8">
+      <span class="text-gradient-gold">doubao2api</span><br>
+      <span class="text-zinc-100 text-3xl md:text-5xl lg:text-5xl font-bold mt-4 block">豆包逆向 API，赋能你的智能体</span>
+    </h1>
+    <!-- Subtitle -->
+    <p class="reveal reveal-delay-2 text-lg md:text-xl text-zinc-400 max-w-2xl leading-relaxed mb-12 font-body">
+      浏览器内置 fetch 调用，自动注入签名。支持多轮对话、深度思考、联网搜索、文生图/视频/音乐、文件理解。零成本接入，一行 curl 即用。
+    </p>
+    <!-- CTA buttons -->
+    <div class="reveal reveal-delay-3 flex flex-wrap gap-4">
+      <a href="https://github.com/wangchuxiaoji-oss/doubao2api" target="_blank"
+         class="inline-flex items-center gap-2 px-7 py-3.5 bg-gradient-to-r from-amber-500 to-amber-600 text-black font-display font-bold rounded-full hover:scale-105 transition-transform shadow-lg shadow-amber-500/20">
+        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.385-1.335-1.755-1.335-1.755-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.605-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12"/></svg>
+        GitHub 仓库
+      </a>
+      <a href="#quickstart"
+         class="inline-flex items-center gap-2 px-7 py-3.5 border border-zinc-700 text-zinc-200 font-display font-bold rounded-full hover:border-amber-500/50 hover:text-amber-400 transition-colors">
+        快速开始 →
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ FEATURES ═══════════ -->
+<section class="relative px-6 py-32 max-w-6xl mx-auto">
+  <h2 class="reveal text-3xl md:text-5xl font-display font-black text-zinc-100 mb-4">核心能力</h2>
+  <p class="reveal reveal-delay-1 text-zinc-500 text-lg mb-16 max-w-xl font-body">一个接口，覆盖豆包全部多模态能力。浏览器级签名，零封控风险。</p>
+
+  <!-- Music player -->
+  <div class="reveal reveal-delay-1 mb-10 flex items-center gap-4 px-5 py-3 rounded-full border border-zinc-800 bg-zinc-900/50 w-fit">
+    <button id="music-btn" onclick="toggleMusic()" class="w-10 h-10 rounded-full bg-amber-500 flex items-center justify-center hover:bg-amber-400 transition-colors shadow-lg shadow-amber-500/20">
+      <svg id="music-play-icon" class="w-4 h-4 text-black ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+      <svg id="music-pause-icon" class="w-4 h-4 text-black hidden" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+    </button>
+    <div class="text-sm">
+      <p class="text-zinc-300 font-display font-bold">由本项目生成的音乐</p>
+      <p class="text-zinc-500 text-xs font-body">doubao2api /v1/audio/generations</p>
+    </div>
+  </div>
+  <audio id="bgm-audio" src="assets/bgm.mp4" preload="metadata"></audio>
+
+  <!-- Asymmetric grid -->
+  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+    <!-- Card 1 — CHAT, spans 2 cols -->
+    <div class="reveal card-glass overflow-hidden lg:col-span-2 flex flex-col md:flex-row">
+      <div class="p-8 flex-1">
+        <div class="text-amber-400 text-sm font-mono mb-3 tracking-wider">对话 · CHAT</div>
+        <h3 class="text-xl font-display font-bold text-zinc-100 mb-2">多模型多轮对话</h3>
+        <p class="text-zinc-400 font-body leading-relaxed">doubao（快速）、doubao-think（深度思考 + reasoning_content）、doubao-expert（专家模式）。支持 conversation_id 多轮上下文、联网搜索、文件/图片理解。</p>
+      </div>
+      <img src="assets/chat.jpg" alt="对话能力" class="w-full md:w-48 lg:w-56 h-48 md:h-auto object-cover">
+    </div>
+    <!-- Card 2 — IMAGE -->
+    <div class="reveal reveal-delay-1 card-glass overflow-hidden flex flex-col">
+      <img src="assets/image.jpg" alt="图片生成" class="w-full h-40 object-cover">
+      <div class="p-6 flex-1">
+        <div class="text-amber-400 text-sm font-mono mb-3 tracking-wider">图片 · IMAGE</div>
+        <h3 class="text-xl font-display font-bold text-zinc-100 mb-2">文生图 / 图生图</h3>
+        <p class="text-zinc-400 font-body leading-relaxed text-sm">文字描述生成图片，或上传参考图 ref_image_key 进行风格迁移。</p>
+      </div>
+    </div>
+    <!-- Card 3 — VIDEO -->
+    <div class="reveal reveal-delay-2 card-glass overflow-hidden flex flex-col">
+      <img src="assets/video.jpg" alt="视频生成" class="w-full h-40 object-cover">
+      <div class="p-6 flex-1">
+        <div class="text-amber-400 text-sm font-mono mb-3 tracking-wider">视频 · VIDEO</div>
+        <h3 class="text-xl font-display font-bold text-zinc-100 mb-2">文生视频</h3>
+        <p class="text-zinc-400 font-body leading-relaxed text-sm">输入文字描述，生成短视频。异步轮询，完成后返回下载链接。</p>
+      </div>
+    </div>
+    <!-- Card 4 — MUSIC -->
+    <div class="reveal reveal-delay-3 card-glass overflow-hidden flex flex-col">
+      <img src="assets/music.jpg" alt="音乐生成" class="w-full h-40 object-cover">
+      <div class="p-6 flex-1">
+        <div class="text-amber-400 text-sm font-mono mb-3 tracking-wider">音乐 · MUSIC</div>
+        <h3 class="text-xl font-display font-bold text-zinc-100 mb-2">文生音乐</h3>
+        <p class="text-zinc-400 font-body leading-relaxed text-sm">描述风格和情绪，生成音乐片段。支持多种曲风。</p>
+      </div>
+    </div>
+    <!-- Card 5 — ARCHITECTURE, spans 2 cols -->
+    <div class="reveal reveal-delay-4 card-glass overflow-hidden lg:col-span-2 flex flex-col md:flex-row">
+      <div class="p-8 flex-1">
+        <div class="text-amber-400 text-sm font-mono mb-3 tracking-wider">架构 · ARCHITECTURE</div>
+        <h3 class="text-xl font-display font-bold text-zinc-100 mb-2">浏览器内 Fetch — 零封控</h3>
+        <p class="text-zinc-400 font-body leading-relaxed">所有 API 调用通过 Playwright 在真实浏览器内执行 fetch()。字节跳动的 fetch hook 自动注入 a_bogus + msToken，签名上下文与请求上下文完全一致，彻底消除 710022004 风控。</p>
+      </div>
+      <img src="assets/architecture.jpg" alt="架构" class="w-full md:w-48 lg:w-56 h-48 md:h-auto object-cover">
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ QUICKSTART ═══════════ -->
+<section id="quickstart" class="relative px-6 py-32 max-w-5xl mx-auto">
+  <div class="grid grid-cols-1 lg:grid-cols-5 gap-12 items-start">
+    <!-- Left: text -->
+    <div class="lg:col-span-2">
+      <h2 class="reveal text-3xl md:text-4xl font-display font-black text-zinc-100 mb-4">快速开始</h2>
+      <p class="reveal reveal-delay-1 text-zinc-400 font-body leading-relaxed mb-6">
+        部署后，一行 curl 即可调用。完全兼容 OpenAI Chat Completions 格式，无需改动现有代码。
+      </p>
+      <div class="reveal reveal-delay-2 space-y-3 text-sm text-zinc-500 font-body">
+        <p>✦ 流式输出（SSE）</p>
+        <p>✦ 多轮对话（conversation_id）</p>
+        <p>✦ 深度思考（reasoning_content）</p>
+        <p>✦ 联网搜索结果提取</p>
+      </div>
+    </div>
+    <!-- Right: code block -->
+    <div class="lg:col-span-3 reveal reveal-delay-2">
+      <div class="code-block">
+        <div class="code-header">
+          <span class="code-dot bg-red-500/80"></span>
+          <span class="code-dot bg-yellow-500/80"></span>
+          <span class="code-dot bg-green-500/80"></span>
+          <span class="ml-2">curl — 对话请求</span>
+        </div>
+        <pre><span class="text-amber-400">curl</span> <span class="text-zinc-300">http://your-server:9090/v1/chat/completions</span> \
+  <span class="text-zinc-500">-H</span> <span class="text-green-400">"Content-Type: application/json"</span> \
+  <span class="text-zinc-500">-d</span> <span class="text-green-400">'{
+    "model": "doubao",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "用三句话解释量子计算"}
+    ]
+  }'</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ ENDPOINTS ═══════════ -->
+<section class="relative px-6 py-32 max-w-5xl mx-auto">
+  <h2 class="reveal text-3xl md:text-4xl font-display font-black text-zinc-100 mb-4">API 端点一览</h2>
+  <p class="reveal reveal-delay-1 text-zinc-500 font-body mb-12">所有端点均兼容 OpenAI SDK 调用方式</p>
+
+  <div class="reveal reveal-delay-2 overflow-hidden rounded-2xl border border-zinc-800">
+    <table class="w-full text-sm">
+      <thead class="bg-zinc-900/80">
+        <tr class="text-left text-zinc-400 font-mono">
+          <th class="px-6 py-4">方法</th>
+          <th class="px-6 py-4">路径</th>
+          <th class="px-6 py-4">说明</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-zinc-800/60">
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-green-400 font-mono">POST</td><td class="px-6 py-3 font-mono text-zinc-300">/v1/chat/completions</td><td class="px-6 py-3 text-zinc-400">对话（流式/非流式）</td></tr>
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-green-400 font-mono">POST</td><td class="px-6 py-3 font-mono text-zinc-300">/v1/images/generations</td><td class="px-6 py-3 text-zinc-400">文生图 / 图生图</td></tr>
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-green-400 font-mono">POST</td><td class="px-6 py-3 font-mono text-zinc-300">/v1/videos/generations</td><td class="px-6 py-3 text-zinc-400">文生视频</td></tr>
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-green-400 font-mono">POST</td><td class="px-6 py-3 font-mono text-zinc-300">/v1/music/generations</td><td class="px-6 py-3 text-zinc-400">文生音乐</td></tr>
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-amber-400 font-mono">POST</td><td class="px-6 py-3 font-mono text-zinc-300">/v1/files</td><td class="px-6 py-3 text-zinc-400">上传文件</td></tr>
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-blue-400 font-mono">GET</td><td class="px-6 py-3 font-mono text-zinc-300">/v1/models</td><td class="px-6 py-3 text-zinc-400">模型列表</td></tr>
+        <tr class="hover:bg-zinc-800/30 transition-colors"><td class="px-6 py-3 text-blue-400 font-mono">GET</td><td class="px-6 py-3 font-mono text-zinc-300">/admin</td><td class="px-6 py-3 text-zinc-400">管理面板</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════ STAR HISTORY ═══════════ -->
+<section class="relative px-6 py-32 max-w-4xl mx-auto text-center">
+  <h2 class="reveal text-3xl md:text-4xl font-display font-black text-zinc-100 mb-4">Star History</h2>
+  <p class="reveal reveal-delay-1 text-zinc-500 font-body mb-10">项目成长轨迹</p>
+  <div class="reveal reveal-delay-2">
+    <a href="https://star-history.com/#wangchuxiaoji-oss/doubao2api&Date" target="_blank">
+      <img src="https://api.star-history.com/svg?repos=wangchuxiaoji-oss/doubao2api&type=Date&theme=dark" alt="Star History Chart" class="w-full rounded-xl border border-zinc-800 hover:border-amber-500/40 transition-colors">
+    </a>
+  </div>
+</section>
+
+<!-- ═══════════ FAQ ═══════════ -->
+<section class="relative px-6 py-32 max-w-3xl mx-auto">
+  <h2 class="reveal text-3xl md:text-4xl font-display font-black text-zinc-100 mb-12">常见问题</h2>
+  <div class="space-y-4" id="faq-list"></div>
+</section>
+
+<!-- ═══════════ SELF-GENERATED NOTICE ═══════════ -->
+<section class="px-6 py-16 text-center">
+  <div class="reveal max-w-2xl mx-auto border border-amber-500/30 rounded-2xl p-8 bg-amber-500/5">
+    <p class="text-amber-400 font-mono text-sm tracking-wider mb-2">✦ META</p>
+    <p class="text-zinc-200 font-display font-bold text-lg mb-2">本页所有图片和音乐均由 doubao2api 生成</p>
+    <p class="text-zinc-400 font-body text-sm leading-relaxed">页面中的 5 张配图通过 <code class="text-amber-400/80">/v1/images/generations</code> 端点生成，背景音乐通过 <code class="text-amber-400/80">/v1/audio/generations</code> 端点生成。所见即所得 — 这就是本项目部署后的实际能力。</p>
+  </div>
+</section>
+
+<!-- ═══════════ FOOTER ═══════════ -->
+<footer class="border-t border-zinc-800 px-6 py-16">
+  <div class="max-w-5xl mx-auto flex flex-col md:flex-row items-center justify-between gap-6">
+    <div class="text-center md:text-left">
+      <p class="font-display font-black text-xl text-gradient-gold">doubao2api</p>
+      <p class="text-zinc-500 text-sm mt-1 font-body">豆包逆向 API · 开源免费 · MIT License</p>
+    </div>
+    <div class="flex gap-6 text-sm text-zinc-400">
+      <a href="https://github.com/wangchuxiaoji-oss/doubao2api" target="_blank" class="hover:text-amber-400 transition-colors">GitHub</a>
+      <a href="https://github.com/wangchuxiaoji-oss/doubao2api/blob/main/README.md" target="_blank" class="hover:text-amber-400 transition-colors">文档</a>
+      <a href="https://github.com/wangchuxiaoji-oss/doubao2api/issues" target="_blank" class="hover:text-amber-400 transition-colors">Issues</a>
+    </div>
+  </div>
+</footer>
+
+<!-- ═══════════ SCRIPTS ═══════════ -->
+<script>
+// Scroll reveal with IntersectionObserver
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -50px 0px' });
+
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+// Music player toggle
+function toggleMusic() {
+  const audio = document.getElementById('bgm-audio');
+  const playIcon = document.getElementById('music-play-icon');
+  const pauseIcon = document.getElementById('music-pause-icon');
+  if (audio.paused) {
+    audio.play();
+    playIcon.classList.add('hidden');
+    pauseIcon.classList.remove('hidden');
+  } else {
+    audio.pause();
+    playIcon.classList.remove('hidden');
+    pauseIcon.classList.add('hidden');
+  }
+}
+
+// FAQ data-driven render
+const faqs = [
+  { q: '需要豆包会员吗？', a: '不需要。只需普通豆包账号登录即可使用全部功能，完全免费。' },
+  { q: '会被风控吗？', a: '采用浏览器内 fetch 架构，签名由字节跳动原生 hook 注入，指纹完全一致。实测连续请求零 710022004 错误。' },
+  { q: '如何登录豆包账号？', a: '服务内置 Xvfb + noVNC。通过浏览器访问 VNC 地址，手动扫码登录一次后 session 持久化，无需重复操作。' },
+  { q: '支持哪些模型？', a: 'doubao（快速回复）、doubao-think（深度思考，输出 reasoning_content）、doubao-expert（专家模式）。可通过 bot_id 切换任意豆包智能体。' },
+];
+const faqContainer = document.getElementById('faq-list');
+faqs.forEach((item, i) => {
+  const div = document.createElement('div');
+  div.className = `reveal reveal-delay-${i+1} faq-item border border-zinc-800 rounded-xl overflow-hidden cursor-pointer`;
+  div.innerHTML = `
+    <div class="flex items-center justify-between px-6 py-5" onclick="this.parentElement.classList.toggle('open')">
+      <span class="font-display font-bold text-zinc-200">${item.q}</span>
+      <svg class="faq-chevron w-5 h-5 text-zinc-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+    </div>
+    <div class="faq-answer px-6 text-zinc-400 font-body leading-relaxed"><p class="pb-5">${item.a}</p></div>`;
+  faqContainer.appendChild(div);
+  observer.observe(div);
+});
+</script>
+</body>
+</html>

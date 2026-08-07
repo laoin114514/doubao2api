@@ -1,0 +1,51 @@
+# doubao2api Linux 部署镜像（Ubuntu/Debian 系）
+#
+# 与官方 Dockerfile 的关键区别：
+#   1. 内置 xvfb 虚拟显示 —— 让 Playwright 以「有头」模式运行，
+#      避免 headless 模式被豆包风控直接拦截（实测踩过的坑）。
+#   2. 通过 `playwright install --with-deps` 自动补齐 chromium 系统依赖。
+#   3. 安装中文字体，保证豆包页面正常渲染。
+#   4. 登录态 profile 通过容器卷挂载，重启容器不掉登录。
+#
+# 构建:  docker build -f Dockerfile.linux -t doubao2api .
+# 运行:  见 DEPLOY_LINUX.md
+
+FROM python:3.12-slim
+
+# 1. 基础系统依赖：xvfb 虚拟显示 + 中文字体
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb \
+        xauth \
+        fonts-noto-cjk \
+        fonts-liberation \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 2. Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+        playwright \
+        playwright-stealth
+
+# 3. 安装 chromium（--with-deps 会自动补齐 nss/atk/gbm 等系统运行库）
+RUN python -m playwright install --with-deps chromium
+
+# 4. 项目代码
+COPY doubao2api/ doubao2api/
+
+# 5. 服务配置
+ENV DOUBAO_HOST=0.0.0.0
+ENV DOUBAO_PORT=9090
+# 有头模式（通过 xvfb 提供虚拟显示）
+ENV DOUBAO_HEADLESS=false
+# 登录态目录（compose 中挂载卷，持久化）
+ENV DOUBAO_BROWSER_DATA=/app/profile
+# API 鉴权密钥（部署时通过 compose 注入，务必设置！）
+ENV DOUBAO_API_KEY=change-me
+
+EXPOSE 9090
+
+# 6. 启动：xvfb-run 提供虚拟 X 显示，浏览器保持「有头」指纹
+CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x900x24' python -m doubao2api"]

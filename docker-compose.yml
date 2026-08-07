@@ -1,0 +1,29 @@
+# doubao2api Docker Compose（Linux 部署）
+#
+# 用法:
+#   docker compose up -d --build
+#
+# 说明:
+#   - ./profile 为登录态目录（自动创建），重启容器登录态不丢
+#   - DOUBAO_API_KEY 为 API 鉴权密钥，务必改成你自己的随机字符串！
+#   - 首次部署后需要扫码登录，见 DEPLOY_LINUX.md 第 4 步
+
+services:
+  doubao2api:
+    build:
+      context: .
+      dockerfile: Dockerfile.linux
+    container_name: doubao2api
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      # 登录态持久化（重要：容器重建后不丢失）
+      - ./profile:/app/profile
+    environment:
+      DOUBAO_HOST: "0.0.0.0"
+      DOUBAO_PORT: "9090"
+      DOUBAO_HEADLESS: "false"
+      DOUBAO_BROWSER_DATA: "/app/profile"
+      # ↓↓↓ 改成你自己的随机密钥，例如: openssl rand -hex 32
+      DOUBAO_API_KEY: "change-me"
