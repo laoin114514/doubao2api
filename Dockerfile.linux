@@ -7,29 +7,48 @@
 #   3. 安装中文字体，保证豆包页面正常渲染。
 #   4. 登录态 profile 通过容器卷挂载，重启容器不掉登录。
 #
-# 构建:  docker build -f Dockerfile.linux -t doubao2api .
+# 【构建加速】默认走国内镜像源（apt / pip / playwright 浏览器），
+#   服务器在国内时 apt-get update 从 17+ 分钟降到 ~1 分钟。
+#   海外服务器可覆盖为官方源：
+#     docker build --build-arg APT_MIRROR=deb.debian.org \
+#                  --build-arg PIP_MIRROR=https://pypi.org/simple \
+#                  --build-arg PLAYWRIGHT_HOST=https://playwright.azureedge.net
+#
+# 构建:  docker compose build          （推荐，自动带镜像源）
 # 运行:  见 DEPLOY_LINUX.md
+
+# --- 可配置镜像源（按服务器厂商选择，见 DEPLOY_LINUX.md 附录） ---
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PLAYWRIGHT_HOST=https://cdn.npmmirror.com/binaries/playwright
 
 FROM python:3.12-slim
 
 # 1. 基础系统依赖：xvfb 虚拟显示 + 中文字体
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#    同时替换 apt 源为国内镜像（关键加速点），并设置下载重试
+ARG APT_MIRROR
+ARG PIP_MIRROR
+ARG PLAYWRIGHT_HOST
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries \
+    && { sed -i "s@http://deb.debian.org@http://${APT_MIRROR}@g; s@http://security.debian.org@http://${APT_MIRROR}@g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; } \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         xvfb \
         xauth \
         fonts-noto-cjk \
-        fonts-liberation \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 2. Python 依赖
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+# 2. Python 依赖（走国内 pip 镜像）
+RUN pip install --no-cache-dir -i ${PIP_MIRROR} \
+        -r requirements.txt \
         playwright \
         playwright-stealth
 
-# 3. 安装 chromium（--with-deps 会自动补齐 nss/atk/gbm 等系统运行库）
+# 3. 安装 chromium（--with-deps 自动补齐 nss/atk/gbm 等系统库，走国内镜像下载）
+ENV PLAYWRIGHT_DOWNLOAD_HOST=${PLAYWRIGHT_HOST}
 RUN python -m playwright install --with-deps chromium
 
 # 4. 项目代码

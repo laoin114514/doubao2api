@@ -1,0 +1,16 @@
+# 加速构建 + 防止敏感数据进镜像
+.git
+.git.shallow.bak
+.gitignore
+profile/
+.doubao_session.json
+.env
+*.log
+__pycache__/
+*.pyc
+test_*.png
+doubao_qr_login.png
+START.md
+DEPLOY_LINUX.md
+docker-compose.yml
+Dockerfile*

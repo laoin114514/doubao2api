@@ -13,6 +13,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.linux
+      # 镜像源可从 .env 覆盖（国内默认阿里云/清华/npmmirror；海外可改官方源）
+      args:
+        APT_MIRROR: "${APT_MIRROR:-mirrors.aliyun.com}"
+        PIP_MIRROR: "${PIP_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        PLAYWRIGHT_HOST: "${PLAYWRIGHT_HOST:-https://cdn.npmmirror.com/binaries/playwright}"
     container_name: doubao2api
     restart: unless-stopped
     ports:

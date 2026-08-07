@@ -114,7 +114,43 @@ model    = doubao        # 可选 doubao-think / doubao-pro / doubao-expert
 2. 若持续验证码，删掉 `./profile` 重新扫码登录，让账号"翻篇"；
 3. 频率过高持续风控 → 换家用网络跑（本机 Windows 方案）。
 
-## 8. 端口与防火墙
+## 9. 构建太慢？排查与加速
+
+**症状**：`docker compose up -d --build` 卡在 `apt-get update` / `pip install` / 下载 chromium 很久（可达 10~20 分钟）。
+
+**原因**：服务器在国内访问国外源（deb.debian.org / pypi.org / Microsoft CDN）慢。
+
+**方案**：Dockerfile.linux 已默认内置国内镜像源（阿里云 apt + 清华 pip + npmmirror 浏览器）。
+按服务器厂商在 `.env` 里覆盖 `APT_MIRROR` 选最快的：
+
+| 服务器厂商 | APT_MIRROR 建议值 |
+|---|---|
+| 阿里云 ECS | `mirrors.aliyun.com`（默认） |
+| 腾讯云 CVM | `mirrors.tencentyun.com`（内网，最快） |
+| 华为云 | `mirrors.huaweicloud.com` |
+| 通用/清华 | `mirrors.tuna.tsinghua.edu.cn` |
+
+```bash
+# 示例：腾讯云服务器
+cat >> .env <<'EOF'
+APT_MIRROR=mirrors.tencentyun.com
+EOF
+docker compose build --progress=plain   # 重新构建
+```
+
+**预期耗时**：镜像源正确时，apt 层 ~1 分钟、chromium 下载 ~1~2 分钟，总构建 3~5 分钟。
+
+**仍然很慢 / 服务器网络极差**：改在本地（Windows）构建镜像推到私有仓库，服务器只 pull：
+```bash
+# 本地构建并推送（国内可用阿里云 ACR 个人版，免费）
+docker build -f Dockerfile.linux -t registry.cn-hangzhou.aliyuncs.com/你的命名空间/doubao2api:latest .
+docker push registry.cn-hangzhou.aliyuncs.com/你的命名空间/doubao2api:latest
+
+# 服务器上改 compose 的 image 指向该镜像并 pull
+docker compose pull && docker compose up -d
+```
+
+## 10. 端口与防火墙
 
 - 服务监听 `9090`；安全组/防火墙放行 `9090`（或只对你自己 IP 开放）。
 - 用 SSH 隧道可以不开公网端口：
