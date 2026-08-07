@@ -16,14 +16,15 @@ services:
     container_name: doubao2api
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      # 宿主机端口从 .env 读取（默认 9090）
+      - "${DOUBAO_PORT:-9090}:${DOUBAO_PORT:-9090}"
     volumes:
       # 登录态持久化（重要：容器重建后不丢失）
       - ./profile:/app/profile
     environment:
       DOUBAO_HOST: "0.0.0.0"
-      DOUBAO_PORT: "9090"
+      DOUBAO_PORT: "${DOUBAO_PORT:-9090}"
       DOUBAO_HEADLESS: "false"
       DOUBAO_BROWSER_DATA: "/app/profile"
-      # ↓↓↓ 改成你自己的随机密钥，例如: openssl rand -hex 32
-      DOUBAO_API_KEY: "change-me"
+      # ↓↓↓ 从 .env 读取（未设时用默认 change-me），生成密钥: openssl rand -hex 32
+      DOUBAO_API_KEY: "${DOUBAO_API_KEY:-change-me}"

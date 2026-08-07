@@ -61,6 +61,11 @@ class BrowserClient:
     def is_ready(self) -> bool:
         return self._ready
 
+    async def get_cookies_dict(self) -> Dict[str, str]:
+        """返回 doubao 域的 cookies 字典（供官方 client 库构造会话用）。"""
+        cookies = await self._context.cookies("https://www.doubao.com")
+        return {c["name"]: c["value"] for c in cookies}
+
     @property
     def page(self) -> Optional[Page]:
         return self._page
@@ -1609,6 +1614,28 @@ class BrowserClient:
             file_refs = [{"uri": file_uri, "name": file_name, "size": file_size}]
         file_attachments = []
         for file_ref in file_refs:
+            if file_ref.get("is_image"):
+                # 图片附件（官方 upload_image 格式）→ 组装成豆包图片附件 type=1
+                file_attachments.append({
+                    "type": 1,
+                    "identifier": str(uuid.uuid4()),
+                    "image": {
+                        "name": file_ref.get("name", "image.png"),
+                        "uri": file_ref.get("uri", ""),
+                        "image_ori": {
+                            "url": file_ref.get("cdn_url", ""),
+                            "width": int(file_ref.get("width", 64)),
+                            "height": int(file_ref.get("height", 64)),
+                            "format": file_ref.get("format", "png"),
+                            "url_formats": {},
+                        },
+                    },
+                    "parse_state": 0,
+                    "review_state": 0,
+                    "name": file_ref.get("name", "image.png"),
+                    "size": int(file_ref.get("size") or 0),
+                })
+                continue
             file_attachments.append({
                 "type": 3,
                 "identifier": str(uuid.uuid4()),
@@ -1625,6 +1652,8 @@ class BrowserClient:
                 "progress": 100,
                 "src": "",
             })
+
+        log.info("chat_with_file attachments=%s", json.dumps(file_attachments, ensure_ascii=False)[:800])
 
         payload = {
             "client_meta": {

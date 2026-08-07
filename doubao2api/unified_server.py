@@ -422,14 +422,48 @@ def create_app(
                         file_refs.append({"url": file_url})
                     elif isinstance(file_url, dict):
                         file_refs.append(file_url)
+                elif part.get("type") == "image_url":
+                    # OpenAI 标准图片消息格式（ZCode 等兼容客户端发图走这里）
+                    image_url = part.get("image_url", {})
+                    if isinstance(image_url, str):
+                        file_refs.append({"url": image_url})
+                    elif isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                        if url:
+                            file_refs.append({"url": url})
         return "\n".join(parts), file_refs
 
     async def _materialize_file_refs(client: BrowserClient, file_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Resolve TOS/data/http file_url references to uploaded file metadata."""
+        """Resolve TOS/data/http file_url references to uploaded file metadata.
+
+        图片（MIME 为 image/* 或常见图片扩展名）走 upload_image，构造豆包
+        图片附件（type=1）；其他文件走 upload_file（type=3 文件附件）。
+        """
         import base64
         import mimetypes
         from urllib.parse import urlparse
         files: list[dict[str, Any]] = []
+
+        def _is_image(mime_type: str, fname: str) -> bool:
+            if mime_type.startswith("image/"):
+                return True
+            return fname.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".avif"))
+
+        async def _image_attachment(file_data: bytes, fname: str) -> dict[str, Any]:
+            img = await client.upload_image(image_bytes=file_data, filename=fname)
+            # 官方 upload_image 返回格式可直接作为官方库 image_attachments 使用
+            return {
+                "is_image": True,
+                "uri": img.get("uri", ""),
+                "cdn_url": img.get("cdn_url", ""),
+                "name": img.get("name", fname),
+                "format": img.get("format", "png"),
+                "width": img.get("width", 64),
+                "height": img.get("height", 64),
+                "size": len(file_data),
+            }
+
         for file_ref in file_refs:
             url = str(file_ref.get("url", "")).strip()
             if not url:
@@ -439,20 +473,18 @@ def create_app(
             if url.startswith("tos-"):
                 files.append({"uri": url, "name": name, "size": size})
                 continue
+            # 统一先拿到字节与 MIME 类型
             if url.startswith("data:"):
                 try:
                     header, encoded = url.split(",", 1)
                     file_data = base64.b64decode(encoded)
                 except (ValueError, TypeError) as exc:
                     raise HTTPException(status_code=400, detail="Invalid data URI") from exc
+                mime_type = header[5:].split(";", 1)[0] if name == "file" else ""
                 if name == "file":
-                    mime_type = header[5:].split(";", 1)[0]
                     ext = mimetypes.guess_extension(mime_type) or ".txt"
                     name = f"upload{ext}"
-                uploaded = await client.upload_file(file_data=file_data, filename=name)
-                files.append({"uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"]})
-                continue
-            if url.startswith("http://") or url.startswith("https://"):
+            elif url.startswith("http://") or url.startswith("https://"):
                 parsed = urlparse(url)
                 inferred_name = parsed.path.rsplit("/", 1)[-1] or "downloaded_file"
                 if name == "file":
@@ -461,10 +493,15 @@ def create_app(
                     response = await http_client.get(url)
                     response.raise_for_status()
                     file_data = response.content
+                mime_type = response.headers.get("content-type", "") or ""
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file_url: {url[:80]}")
+
+            if _is_image(mime_type, name):
+                files.append(await _image_attachment(file_data, name))
+            else:
                 uploaded = await client.upload_file(file_data=file_data, filename=name)
                 files.append({"uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"]})
-                continue
-            raise HTTPException(status_code=400, detail=f"Unsupported file_url: {url[:80]}")
         return files
 
     # ── Request logging middleware ──
@@ -546,9 +583,16 @@ def create_app(
             if not has_tools:
                 _, file_refs_check = _extract_prompt_and_file_refs(body.messages)
                 if file_refs_check:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="file_url attachments are currently supported for non-streaming requests only",
+                    # 带附件（图片/文件）的流式请求：收集全文后用 SSE 一次性返回，
+                    # 避免直接 400（客户端如 ZCode 默认 stream=true 发图）
+                    return StreamingResponse(
+                        _stream_collect_with_files(client, prompt, use_deep_think,
+                                                   request_id, model_name,
+                                                   file_refs_check,
+                                                   conversation_id=body.conversation_id,
+                                                   bot_id=body.bot_id),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                     )
             return StreamingResponse(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
@@ -585,14 +629,34 @@ def create_app(
                     finish_reason = "stop"
             elif file_refs:
                 files = await _materialize_file_refs(client, file_refs)
-                result = await client.chat_with_file(
-                    text=prompt,
-                    file_uri=files,
-                    file_name=files[0]["name"],
-                    file_size=files[0]["size"],
-                    use_deep_think=use_deep_think,
-                )
-                message = {"role": "assistant", "content": result["text"]}
+                images = [f for f in files if f.get("is_image")]
+                if images:
+                    # 图片对话走官方 client 库路径（/chat/completion 图片附件实测不被识别）
+                    from .client import DoubaoChatClient, EXTENSION_BOT_ID
+                    async with DoubaoChatClient(
+                        cookies=await client.get_cookies_dict(),
+                        ms_token=client._ms_token or "",
+                        device_id=client._device_id or "",
+                        web_id=client._web_id or "",
+                        fp=client._fp or "",
+                        bot_id=body.bot_id or EXTENSION_BOT_ID,
+                        captcha_handler=None,
+                    ) as dclient:
+                        result = await dclient.chat_completion(
+                            text=prompt,
+                            image_attachments=images,
+                            need_deep_think=use_deep_think,
+                        )
+                    message = {"role": "assistant", "content": result.text}
+                else:
+                    result = await client.chat_with_file(
+                        text=prompt,
+                        file_uri=files,
+                        file_name=files[0]["name"],
+                        file_size=files[0]["size"],
+                        use_deep_think=use_deep_think,
+                    )
+                    message = {"role": "assistant", "content": result["text"]}
                 finish_reason = "stop"
             else:
                 message = await _collect_chat_response(
@@ -1161,6 +1225,58 @@ def create_app(
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
+
+    async def _stream_collect_with_files(
+        client: BrowserClient,
+        prompt: str,
+        use_deep_think: int,
+        request_id: str,
+        model: str,
+        file_refs: list[dict[str, Any]],
+        *,
+        conversation_id: Optional[str] = None,
+        bot_id: Optional[str] = None,
+    ):
+        """带附件（图片/文件）的流式请求：收集全文后按 OpenAI SSE 一次性吐出。
+
+        图片走官方 client 库路径（/chat/completion 图片附件不被豆包识别），
+        普通文件走 BrowserClient.chat_with_file。
+        """
+        files = await _materialize_file_refs(client, file_refs)
+        images = [f for f in files if f.get("is_image")]
+
+        if images:
+            from .client import DoubaoChatClient, EXTENSION_BOT_ID
+            async with DoubaoChatClient(
+                cookies=await client.get_cookies_dict(),
+                ms_token=client._ms_token or "",
+                device_id=client._device_id or "",
+                web_id=client._web_id or "",
+                fp=client._fp or "",
+                bot_id=bot_id or EXTENSION_BOT_ID,
+                captcha_handler=None,
+            ) as dclient:
+                result = await dclient.chat_completion(
+                    text=prompt,
+                    image_attachments=images,
+                    need_deep_think=use_deep_think,
+                )
+            full_text = result.text
+        else:
+            result = await client.chat_with_file(
+                text=prompt, file_uri=files,
+                file_name=files[0]["name"], file_size=files[0]["size"],
+                use_deep_think=use_deep_think,
+            )
+            full_text = result["text"]
+
+        def _chunk(delta: dict, finish=None) -> str:
+            return f"data: {json.dumps({'id': request_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
+
+        if full_text:
+            yield _chunk({"role": "assistant", "content": full_text})
+        yield _chunk({}, "stop")
+        yield "data: [DONE]\n\n"
 
     async def _collect_chat_response(
         client: BrowserClient,
