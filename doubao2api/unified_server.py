@@ -280,6 +280,7 @@ def _check_risk_backoff() -> None:
                 "Doubao upstream rate limit (710022004) cooldown active, "
                 f"retry in {remaining}s. Reduce request frequency and wait."
             ),
+            headers={"Retry-After": str(remaining)},
         )
 
 
@@ -500,9 +501,11 @@ def create_app(
 
     @app.exception_handler(HTTPException)
     async def _http_exc(request: Request, exc: HTTPException):
+        headers = dict(exc.headers or {})
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"message": exc.detail, "type": "api_error", "code": exc.status_code}},
+            headers=headers,
         )
 
     @app.exception_handler(Exception)
