@@ -36,6 +36,7 @@ from .browser_client import BrowserClient
 from .qianwen_client import QIANWEN_MODELS, QianwenClient
 from .token_counter import SAFETY_FACTOR, count_messages_tokens, count_tokens
 from .tool_calling import (
+    StreamingToolRouter,
     ToolNameObfuscator,
     build_continuation_prompt,
     coerce_tool_arguments,
@@ -43,7 +44,6 @@ from .tool_calling import (
     deduplicate_continuation,
     detect_truncated_tool_call,
     filter_history_by_topic,
-    has_complete_tool_calls,
     is_tool_call_start,
     parse_tool_calls_xml,
 )
@@ -209,6 +209,25 @@ class ExpertQuotaTracker:
         import time
         self._last_retry_time = time.time()
 
+    def report_rate_limit(self):
+        """Upstream explicitly rate-limited expert mode: fall back to think.
+
+        This happens when the account exhausts the expert/深度思考 quota, and is
+        surfaced as error_code 710022004 with a "rate limited" message. Tool
+        calling forces expert mode, so without this fallback every tool request
+        would fail with 502 until the quota window resets.
+        """
+        import time
+        if not self._degraded:
+            log.warning(
+                "Expert mode rate-limited by upstream; falling back to think "
+                "for %d seconds",
+                self._retry_interval,
+            )
+        self._degraded = True
+        self._no_reasoning_count = self._threshold
+        self._last_retry_time = time.time()
+
     def get_effective_mode(self, requested_deep_think: int) -> tuple[int, str]:
         """Return (deep_think_value, model_name) considering degradation.
 
@@ -221,6 +240,47 @@ class ExpertQuotaTracker:
 
 
 _expert_tracker = ExpertQuotaTracker()
+
+_RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "too many", "限流")
+
+
+def _looks_rate_limited(code: int, message: str) -> bool:
+    """True when an upstream error indicates transient rate limiting."""
+    text = (message or "").lower()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+# Risk-control cooldown: after a 710022004 "rate limited" response upstream,
+# reject new chat requests locally for a while instead of hammering the account
+# (retrying immediately extends the ban and turns into a retry storm).
+_RATE_LIMIT_COOLDOWN = max(10, _env_int("DOUBAO_RATE_LIMIT_COOLDOWN", 120))
+_risk_backoff_until: float = 0.0
+
+
+def _enter_risk_backoff(seconds=None) -> None:
+    """Start (or extend) the local cooldown window."""
+    global _risk_backoff_until
+    _risk_backoff_until = time.time() + (
+        seconds if seconds is not None else _RATE_LIMIT_COOLDOWN
+    )
+
+
+def _risk_backoff_remaining() -> int:
+    """Seconds left in the local risk-control cooldown (0 = clear)."""
+    return max(0, int(_risk_backoff_until - time.time()))
+
+
+def _check_risk_backoff() -> None:
+    """Raise a clear 429 while the upstream rate-limit cooldown is active."""
+    remaining = _risk_backoff_remaining()
+    if remaining > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Doubao upstream rate limit (710022004) cooldown active, "
+                f"retry in {remaining}s. Reduce request frequency and wait."
+            ),
+        )
 
 
 def _size_to_ratio(size):
@@ -693,6 +753,7 @@ def create_app(
             result["needs_captcha"] = client.needs_captcha
             result["last_error_code"] = client.last_error_code
         result["expert_degraded"] = _expert_tracker.is_degraded
+        result["rate_limit_cooldown_remaining"] = _risk_backoff_remaining()
         # Qianwen status
         qw = _qianwen.get("client")
         result["qianwen_ready"] = qw.is_ready if qw else False
@@ -706,6 +767,7 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
         _check_auth(request)
+        _check_risk_backoff()
 
         # ── Route resolution (validate before consuming rate-limit tokens) ──
         is_qianwen = body.model in QIANWEN_MODEL_NAMES
@@ -851,6 +913,9 @@ def create_app(
                 finish_reason = "stop"
         except RuntimeError as exc:
             client.record_failure()
+            if _looks_rate_limited(0, str(exc)):
+                _enter_risk_backoff()
+                _expert_tracker.report_rate_limit()
             raise HTTPException(status_code=502, detail=str(exc))
 
         # max_tokens truncation (non-streaming only)
@@ -1554,7 +1619,10 @@ def create_app(
             if event.get("error_code"):
                 code = event.get("error_code", 0)
                 msg = event.get("error_msg", "")
-                client.record_failure(code)
+                client.record_failure(code, msg)
+                if _looks_rate_limited(code, msg):
+                    _enter_risk_backoff()
+                    _expert_tracker.report_rate_limit()
                 raise RuntimeError(f"Error code={code}: {msg}")
 
             # Extract conversation_id for multi-turn
@@ -1651,9 +1719,14 @@ def create_app(
         # Track last emitted result count per block_id for incremental updates
         search_last_count: dict = {}
         result_conversation_id: Optional[str] = None
-        # Tool calling state
-        tool_buffer = ""  # accumulates text when tool call detected
-        tool_mode = False  # True when we're buffering potential tool call XML
+        # Tool calling state: incremental router handles prose-before-XML and
+        # XML split across chunks (otherwise raw <tool_call> leaks as content).
+        tool_router = (
+            StreamingToolRouter(valid_tool_names=valid_tool_names)
+            if has_tools
+            else None
+        )
+        tool_call_index = 0
         emitted_tool_calls = False  # True once we've emitted tool_calls chunks
 
         def _make_chunk(delta: dict, finish_reason=None):
@@ -1678,6 +1751,50 @@ def create_app(
             if isinstance(dc, dict):
                 yield from dc.get("content_block", [])
 
+        def _router_sse(events) -> list[str]:
+            """Convert StreamingToolRouter events into OpenAI SSE data lines."""
+            nonlocal stream_content_chars, emitted_tool_calls, tool_call_index
+            lines: list[str] = []
+            for kind, value in events:
+                if kind == "content":
+                    if not value:
+                        continue
+                    stream_content_chars += len(value)
+                    chunk = _make_chunk({"role": "assistant", "content": value})
+                    lines.append(
+                        f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    )
+                    continue
+                emitted_tool_calls = True
+                idx = tool_call_index
+                tool_call_index += 1
+                name_chunk = _make_chunk({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "index": idx,
+                        "id": value["id"],
+                        "type": "function",
+                        "function": {
+                            "name": value["function"]["name"],
+                            "arguments": "",
+                        },
+                    }],
+                })
+                lines.append(
+                    f"data: {json.dumps(name_chunk, ensure_ascii=False)}\n\n"
+                )
+                args_chunk = _make_chunk({
+                    "tool_calls": [{
+                        "index": idx,
+                        "function": {"arguments": value["function"]["arguments"]},
+                    }],
+                })
+                lines.append(
+                    f"data: {json.dumps(args_chunk, ensure_ascii=False)}\n\n"
+                )
+            return lines
+
         try:
             async for event in client.chat_completion(
                 prompt, use_deep_think=use_deep_think,
@@ -1689,6 +1806,9 @@ def create_app(
                     body_text = str(event.get("body", ""))[:300]
                     log.error("Upstream stream error (status=%s): %s", status, body_text)
                     client.record_failure()
+                    if _looks_rate_limited(status, body_text):
+                        _enter_risk_backoff()
+                        _expert_tracker.report_rate_limit()
                     err = {
                         "error": {
                             "message": f"Upstream error (status={status}): {body_text}",
@@ -1713,7 +1833,10 @@ def create_app(
                     code = event.get("error_code", 0)
                     msg = event.get("error_msg", "unknown error")
                     log.error("Upstream error event: code=%s msg=%s", code, msg)
-                    client.record_failure(code)
+                    client.record_failure(code, msg)
+                    if _looks_rate_limited(code, msg):
+                        _enter_risk_backoff()
+                        _expert_tracker.report_rate_limit()
                     err = {
                         "error": {
                             "message": f"Upstream error code={code}: {msg}",
@@ -1733,72 +1856,11 @@ def create_app(
                     and event["text"]
                 ):
                     t = event["text"]
-                    # Tool calling: buffer text to detect XML tool_calls
-                    if has_tools and not in_thinking:
-                        tool_buffer += t
-                        if not tool_mode and is_tool_call_start(tool_buffer):
-                            tool_mode = True
-                        if tool_mode:
-                            # Check if we have complete tool calls
-                            if has_complete_tool_calls(tool_buffer):
-                                # Parse and emit as tool_calls
-                                parsed = parse_tool_calls_xml(tool_buffer, valid_tool_names=valid_tool_names)
-                                if parsed:
-                                    # Emit tool_calls in OpenAI streaming format
-                                    for idx, tc in enumerate(parsed):
-                                        # First chunk: role + tool_call with function name
-                                        delta_tc = {
-                                            "role": "assistant",
-                                            "content": None,
-                                            "tool_calls": [{
-                                                "index": idx,
-                                                "id": tc["id"],
-                                                "type": "function",
-                                                "function": {
-                                                    "name": tc["function"]["name"],
-                                                    "arguments": "",
-                                                },
-                                            }],
-                                        }
-                                        chunk = _make_chunk(delta_tc)
-                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                        # Second chunk: arguments content
-                                        delta_args = {
-                                            "tool_calls": [{
-                                                "index": idx,
-                                                "function": {
-                                                    "arguments": tc["function"]["arguments"],
-                                                },
-                                            }],
-                                        }
-                                        chunk = _make_chunk(delta_args)
-                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                    tool_buffer = ""
-                                    tool_mode = False
-                                    emitted_tool_calls = True
-                                else:
-                                    # XML complete but parse failed — flush as content
-                                    log.warning("Tool call XML parse failed, flushing as content")
-                                    delta = {"role": "assistant", "content": tool_buffer}
-                                    chunk = _make_chunk(delta)
-                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                    tool_buffer = ""
-                                    tool_mode = False
-                            continue  # don't emit raw text while in tool mode
-                        else:
-                            # Not a tool call start — flush buffer as normal content
-                            if len(tool_buffer) > 20 and not is_tool_call_start(tool_buffer):
-                                delta = {"role": "assistant", "content": tool_buffer}
-                                chunk = _make_chunk(delta)
-                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                tool_buffer = ""
-                            elif not tool_buffer.strip().startswith("<"):
-                                # Definitely not XML, flush immediately
-                                delta = {"role": "assistant", "content": tool_buffer}
-                                chunk = _make_chunk(delta)
-                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                tool_buffer = ""
-                            continue
+                    # Tool calling: incremental router (handles prose before XML)
+                    if tool_router is not None and not in_thinking:
+                        for line in _router_sse(tool_router.feed(t)):
+                            yield line
+                        continue
                     # Normal (non-tool) path
                     if in_thinking:
                         delta = {"reasoning_content": t}
@@ -1856,42 +1918,10 @@ def create_app(
                         tb = block_content.get("text_block", {})
                         if isinstance(tb, dict) and tb.get("text"):
                             t = tb["text"]
-                            # Tool calling: buffer text for XML detection
-                            if has_tools and not in_thinking:
-                                tool_buffer += t
-                                if not tool_mode and is_tool_call_start(tool_buffer):
-                                    tool_mode = True
-                                if tool_mode:
-                                    if has_complete_tool_calls(tool_buffer):
-                                        parsed = parse_tool_calls_xml(tool_buffer, valid_tool_names=valid_tool_names)
-                                        if parsed:
-                                            for idx, tc in enumerate(parsed):
-                                                delta_tc = {
-                                                    "role": "assistant", "content": None,
-                                                    "tool_calls": [{"index": idx, "id": tc["id"], "type": "function",
-                                                        "function": {"name": tc["function"]["name"], "arguments": ""}}],
-                                                }
-                                                chunk = _make_chunk(delta_tc)
-                                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                                delta_args = {"tool_calls": [{"index": idx,
-                                                    "function": {"arguments": tc["function"]["arguments"]}}]}
-                                                chunk = _make_chunk(delta_args)
-                                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                            tool_buffer = ""
-                                            tool_mode = False
-                                            emitted_tool_calls = True
-                                        else:
-                                            # XML complete but parse failed
-                                            delta = {"role": "assistant", "content": tool_buffer}
-                                            chunk = _make_chunk(delta)
-                                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                            tool_buffer = ""
-                                            tool_mode = False
-                                elif len(tool_buffer) > 20 and not is_tool_call_start(tool_buffer):
-                                    delta = {"role": "assistant", "content": tool_buffer}
-                                    chunk = _make_chunk(delta)
-                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                    tool_buffer = ""
+                            # Tool calling: incremental router (same as CHUNK_DELTA)
+                            if tool_router is not None and not in_thinking:
+                                for line in _router_sse(tool_router.feed(t)):
+                                    yield line
                                 continue
                             if in_thinking:
                                 delta = {"reasoning_content": t}
@@ -1938,34 +1968,10 @@ def create_app(
             yield "data: [DONE]\n\n"
             return
 
-        # Flush any remaining tool buffer
-        if tool_buffer:
-            if tool_mode and has_complete_tool_calls(tool_buffer):
-                parsed = parse_tool_calls_xml(tool_buffer, valid_tool_names=valid_tool_names)
-                if parsed:
-                    for idx, tc in enumerate(parsed):
-                        delta_tc = {
-                            "role": "assistant", "content": None,
-                            "tool_calls": [{"index": idx, "id": tc["id"], "type": "function",
-                                "function": {"name": tc["function"]["name"], "arguments": ""}}],
-                        }
-                        chunk = _make_chunk(delta_tc)
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                        delta_args = {"tool_calls": [{"index": idx,
-                            "function": {"arguments": tc["function"]["arguments"]}}]}
-                        chunk = _make_chunk(delta_args)
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    emitted_tool_calls = True
-                else:
-                    # Parse failed — flush as content
-                    delta = {"role": "assistant", "content": tool_buffer}
-                    chunk = _make_chunk(delta)
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            elif tool_buffer.strip():
-                # Emit as regular content
-                delta = {"role": "assistant", "content": tool_buffer}
-                chunk = _make_chunk(delta)
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        # Flush any remaining tool-router buffer (e.g. truncated XML at EOF)
+        if tool_router is not None:
+            for line in _router_sse(tool_router.flush()):
+                yield line
 
         # Final chunk with usage
         client.record_success()

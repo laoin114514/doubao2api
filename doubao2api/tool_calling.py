@@ -367,6 +367,121 @@ def has_complete_tool_calls(text: str) -> bool:
     return False
 
 
+_TOOL_CALL_OPEN = "<tool_call>"
+_TOOL_CALLS_OPEN = "<tool_calls>"
+_TOOL_CALL_OPEN_MARKERS = (_TOOL_CALL_OPEN, _TOOL_CALLS_OPEN)
+_TOOL_CALL_CLOSE_MARKERS = ("</tool_call>", "</tool_calls>")
+
+
+class StreamingToolRouter:
+    """Incrementally split a token stream into visible text and tool calls.
+
+    Models commonly prepend a sentence before the XML block and the XML itself
+    arrives split across arbitrary chunks, e.g.::
+
+        "已获取到部分硬件信息，下面补全：\\n\\n<tool_" + "call>{...}</tool_call>"
+
+    The old ``startswith()``-based detection flushed the leading prose as
+    normal content and never entered tool mode, so the raw ``<tool_call>``
+    markup leaked to the client as assistant content. This router fixes that by:
+
+    * holding back only a short marker-sized tail (markers can be split),
+    * emitting prose before a marker as normal content,
+    * buffering from the marker until the closing tag arrives,
+    * parsing one or more complete tool calls (with optional name whitelist),
+    * handling text between consecutive tool calls.
+
+    ``feed()`` / ``flush()`` return ``(kind, value)`` tuples where ``kind`` is
+    ``"content"`` (str) or ``"tool_call"`` (OpenAI tool_call dict).
+    """
+
+    _TAIL_HOLDBACK = max(len(m) for m in _TOOL_CALL_OPEN_MARKERS) - 1
+
+    def __init__(self, valid_tool_names: Optional[set[str]] = None):
+        self._buf = ""
+        self._in_tool = False
+        self._valid = valid_tool_names
+
+    def _find_marker(self) -> int:
+        positions = [self._buf.find(m) for m in _TOOL_CALL_OPEN_MARKERS]
+        positions = [pos for pos in positions if pos >= 0]
+        return min(positions) if positions else -1
+
+    def _marker_prefix_len(self) -> int:
+        """Length of the buffer tail that could be the start of a marker."""
+        best = 0
+        for marker in _TOOL_CALL_OPEN_MARKERS:
+            for k in range(1, min(len(marker), len(self._buf)) + 1):
+                if self._buf.endswith(marker[:k]):
+                    best = max(best, k)
+        return best
+
+    def _last_complete_end(self) -> int:
+        ends = []
+        for marker in _TOOL_CALL_CLOSE_MARKERS:
+            idx = self._buf.rfind(marker)
+            if idx >= 0:
+                ends.append(idx + len(marker))
+        return max(ends) if ends else 0
+
+    def feed(self, text: str) -> list[tuple[str, Any]]:
+        """Feed a streamed text chunk, returning events that are safe to emit."""
+        if not text:
+            return []
+        self._buf += text
+        return self._drain()
+
+    def flush(self) -> list[tuple[str, Any]]:
+        """Flush whatever is still buffered at end-of-stream."""
+        if not self._buf:
+            return []
+        out: list[tuple[str, Any]] = []
+        if self._in_tool:
+            parsed = parse_tool_calls_xml(self._buf, valid_tool_names=self._valid)
+            if parsed:
+                out.extend(("tool_call", tc) for tc in parsed)
+            elif self._buf.strip():
+                out.append(("content", self._buf))
+        else:
+            out.append(("content", self._buf))
+        self._buf = ""
+        self._in_tool = False
+        return out
+
+    def _drain(self) -> list[tuple[str, Any]]:
+        out: list[tuple[str, Any]] = []
+        while True:
+            if not self._in_tool:
+                idx = self._find_marker()
+                if idx >= 0:
+                    if idx > 0:
+                        out.append(("content", self._buf[:idx]))
+                    self._buf = self._buf[idx:]
+                    self._in_tool = True
+                    continue
+                emit_len = len(self._buf) - self._marker_prefix_len()
+                if emit_len > 0:
+                    out.append(("content", self._buf[:emit_len]))
+                    self._buf = self._buf[emit_len:]
+                return out
+
+            if has_complete_tool_calls(self._buf):
+                end = self._last_complete_end()
+                segment = self._buf[:end]
+                parsed = parse_tool_calls_xml(segment, valid_tool_names=self._valid)
+                rest = self._buf[end:]
+                if parsed:
+                    out.extend(("tool_call", tc) for tc in parsed)
+                elif segment.strip():
+                    # Complete block but nothing parsed (e.g. all names were
+                    # filtered out): fall back to emitting the raw text.
+                    out.append(("content", segment))
+                self._buf = rest
+                self._in_tool = False
+                continue
+            return out
+
+
 # ── Message conversion for multi-turn tool use ──
 
 # Qianwen web model token limit is ~32K tokens.

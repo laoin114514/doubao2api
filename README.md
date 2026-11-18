@@ -1051,6 +1051,7 @@ server {
 | `DOUBAO_ENABLE_ADMIN_DEBUG` | `false` | 管理调试开关：开启后才允许 `POST /auth/eval` 与 `/admin/api/cookies` 导出明文 Cookie |
 | `DOUBAO_ALLOW_PRIVATE_FILE_URLS` | `false` | 允许远程 `file_url` 下载内网/私有地址（默认关闭，防 SSRF） |
 | `DOUBAO_FILE_URL_MAX_MB` | `50` | 远程 `file_url` 下载大小上限（MB） |
+| `DOUBAO_RATE_LIMIT_COOLDOWN` | `120` | 上游返回 710022004 限流后本地冷却秒数；期间聊天请求返回 429，避免重试风暴 |
 | `QIANWEN_ENABLED` | `false` | 启用千问（Qianwen）上游，提供 `qianwen-*` 模型 |
 | `QIANWEN_HEADLESS` | `true` | 千问浏览器是否无头运行 |
 | `QIANWEN_BROWSER_DATA` | `~/.qianwen_browser` | 千问浏览器持久化用户目录 |

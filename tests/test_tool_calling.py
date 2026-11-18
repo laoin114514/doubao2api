@@ -13,6 +13,7 @@ import pytest
 from doubao2api.tool_calling import (
     PRIORITY_TOOLS,
     StreamingGuard,
+    StreamingToolRouter,
     build_tool_system_prompt,
     detect_truncated_tool_call,
     format_tools_for_prompt,
@@ -435,3 +436,66 @@ class TestStreamingGuard:
         assert guard.has_incomplete_tool_call() is True
         guard.feed("</tool_call>")
         assert guard.has_incomplete_tool_call() is False
+
+
+class TestStreamingToolRouter:
+    """Regression tests: prose-before-XML and split-chunk tool calls.
+
+    Bug: the old streaming code used startswith("<tool_call>") on the buffer,
+    so a model reply like "已获取到硬件信息：\n\n<tool_call>{...}" leaked the raw
+    XML to the client as assistant content instead of emitting tool_calls.
+    """
+
+    @staticmethod
+    def _collect(chunks, valid=None):
+        router = StreamingToolRouter(valid_tool_names=valid)
+        events = []
+        for chunk in chunks:
+            events.extend(router.feed(chunk))
+        events.extend(router.flush())
+        return events
+
+    def test_prose_before_xml(self):
+        chunks = [
+            "已获取到部分硬件信息，下面补全内存与磁盘信息：\n\n<tool_",
+            'call>{"name": "Bash", "arguments": {"command": "echo hi"}}</tool_call>',
+        ]
+        events = self._collect(chunks)
+        content = "".join(v for k, v in events if k == "content")
+        calls = [v for k, v in events if k == "tool_call"]
+        assert "已获取到部分硬件信息" in content
+        assert "<tool_call>" not in content
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "Bash"
+
+    def test_char_by_char_split_with_text_between_calls(self):
+        text = (
+            '好的<tool_call>{"name": "A", "arguments": {}}</tool_call>'
+            '中间<tool_call>{"name": "B", "arguments": {}}</tool_call>结束'
+        )
+        events = self._collect(list(text))  # worst case: 1-char chunks
+        content = "".join(v for k, v in events if k == "content")
+        calls = [v for k, v in events if k == "tool_call"]
+        assert "好的" in content
+        assert "中间" in content
+        assert "结束" in content
+        assert "<tool_call>" not in content
+        assert [c["function"]["name"] for c in calls] == ["A", "B"]
+
+    def test_whitelist_filters_hallucinated_name(self):
+        text = '<tool_call>{"name": "Hacker", "arguments": {}}</tool_call>'
+        events = self._collect([text], valid={"Bash"})
+        calls = [v for k, v in events if k == "tool_call"]
+        assert calls == []
+        # Complete block but filtered: falls back to raw text as content.
+        assert "<tool_call>" in "".join(v for k, v in events if k == "content")
+
+    def test_plain_text_streams_without_delay(self):
+        router = StreamingToolRouter()
+        assert router.feed("hello") == [("content", "hello")]
+        assert router.flush() == []
+
+    def test_incomplete_xml_at_eof_is_flushed_as_content(self):
+        events = self._collect(['<tool_call>{"name": "A"'])
+        assert events and events[-1][0] == "content"
+        assert '"name": "A"' in events[-1][1]

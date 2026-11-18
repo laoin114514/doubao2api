@@ -89,13 +89,30 @@ class BrowserClient:
         self._last_error_code = 0
         self._needs_captcha = False
 
-    def record_failure(self, error_code: int = 0):
-        """Track consecutive failures. Mark captcha-needed on 710022004."""
+    def record_failure(self, error_code: int = 0, message: str = ""):
+        """Track consecutive failures.
+
+        ``710022004`` is a risk-control code used both for real captcha
+        challenges and for plain rate limiting. Only the former needs manual
+        verification, so a rate-limit message does not set ``needs_captcha``
+        (and does not count towards the not-ready threshold).
+        """
+        lowered = (message or "").lower()
+        rate_limited = error_code == 710022004 and any(
+            keyword in lowered for keyword in ("rate limit", "rate_limit", "too many", "限流")
+        )
+        if rate_limited:
+            self._last_error_code = error_code
+            log.warning("Rate limited by upstream (710022004): %s", message[:120])
+            return
         self._consecutive_failures += 1
         self._last_error_code = error_code
         if error_code == 710022004:
             self._needs_captcha = True
-            log.warning("Captcha required (710022004) - marking needs_captcha=True")
+            log.warning(
+                "Captcha verification required (710022004): %s - needs_captcha=True",
+                message[:120] or "no message",
+            )
         if self._consecutive_failures >= 5:
             log.error("5 consecutive failures - marking not ready")
             self._ready = False
