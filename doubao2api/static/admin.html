@@ -134,13 +134,18 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 <div class="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-brand-500 to-purple-600 flex items-center justify-center">
 <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"/></svg>
 </div>
-<p class="text-slate-400 mb-4">使用豆包 App 扫码登录</p>
-<button @click="startQr" class="btn">生成二维码</button></div>
+<p class="text-slate-400 mb-1">使用豆包 App 扫码登录</p>
+<p class="text-xs text-slate-500 mb-4">推荐官方网页登录二维码；若扫码提示 404，请换用下方的备用二维码</p>
+<button @click="startBrowserQr" class="btn">生成登录二维码（推荐）</button>
+<button @click="startQr" class="btn-sm mt-3 text-slate-400">备用：API 二维码（部分账号扫码 404）</button></div>
 <div v-else class="py-4">
 <div class="bg-white p-3 rounded-xl inline-block mb-3">
 <img :src="'data:image/png;base64,'+qr.img" class="w-44 h-44"/></div>
 <p class="text-sm" :class="qrColor">{{qr.text}}</p>
-<button v-if="qr.st==='expired'||qr.st==='error'" @click="startQr" class="btn mt-4">重新生成</button>
+<div class="mt-4 flex items-center justify-center gap-3">
+<button @click="startBrowserQr" class="btn-sm">刷新官方二维码</button>
+<button @click="startQr" class="btn-sm text-slate-400">备用 API 二维码</button>
+</div>
 </div></div>
 <div class="card mt-4 max-w-2xl mx-auto">
 <details id="vnc-details">
@@ -236,7 +241,7 @@ const session=ref(null);
 const sysInfo=ref(null);
 const cookieData=reactive({cookies:[],total:0,file:null,masked_values:false});
 const probe=reactive({loading:false,result:'',ms:0,time:''});
-const qr=reactive({img:'',st:'',text:'等待生成'});
+const qr=reactive({img:'',st:'',text:'等待生成',source:''});
 const test=reactive({model:'doubao-think',stream:true,prompt:'',output:'',thinking:'',thinkOpen:true,error:'',loading:false,ms:0,searchResults:null});
 const logs=ref([]);
 const screenshot=reactive({img:"",loading:false,time:""});
@@ -257,7 +262,16 @@ async function fetchCookies(){try{const d=await api('/admin/api/cookies');cookie
 async function fetchLogs(){try{logs.value=(await api('/admin/api/logs')).reverse()}catch(e){}}
 async function fetchOverview(){fetchSession();fetchSystem();fetchCookies()}
 let qrPoll=null;
-async function startQr(){qr.img='';qr.st='';qr.text='生成中...';
+async function startBrowserQr(){qr.img='';qr.st='';qr.text='正在打开浏览器登录框...';qr.source='browser';
+try{const r=await api('/auth/login-qr');
+if(r.status==='already_logged_in'){qrLoginSuccess()}
+else if(r.qr_image_base64){qr.img=r.qr_image_base64;qr.st='waiting_scan';qr.text='请用豆包 App「扫一扫」扫描二维码';pollBrowserLogin()}
+else{qr.st='error';qr.text='生成失败: '+(r.detail||r.error||'unknown')}}catch(e){qr.st='error';qr.text='请求失败: '+e.message}}
+function pollBrowserLogin(){if(qrPoll)clearInterval(qrPoll);
+qrPoll=setInterval(async()=>{try{const d=await api('/auth/status');
+if(d.logged_in){clearInterval(qrPoll);qrPoll=null;qrLoginSuccess()}}catch(e){}},2000)}
+async function startQr(){if(qrPoll){clearInterval(qrPoll);qrPoll=null}
+qr.img='';qr.st='';qr.text='生成中...';qr.source='api';
 try{const r=await api('/v1/session/qr-login',{method:'POST'});
 if(r.qr_image_base64){qr.img=r.qr_image_base64;qr.st='waiting_scan';qr.text='请用豆包 App 扫码';pollQr()}
 else{qr.text='生成失败: '+(r.detail||r.error||'unknown');qr.st='error'}}catch(e){qr.text='请求失败';qr.st='error'}}
@@ -306,7 +320,7 @@ onMounted(()=>{fetchOverview();fetchLogs();currentTime.value=new Date().toLocale
 setInterval(()=>{if(activeTab.value===0)fetchSession()},10000);
 setInterval(()=>{if(activeTab.value===3)fetchLogs()},5000)});
 return{tabs,icons,activeTab,session,sysInfo,cookieData,probe,qr,qrColor,test,logs,allModels,currentTime,screenshot,
-fmtDur,fmtTime,fetchOverview,probeSession,fetchLogs,startQr,loadVnc,takeScreenshot,runTest}}}).mount('#app');
+fmtDur,fmtTime,fetchOverview,probeSession,fetchLogs,startQr,startBrowserQr,loadVnc,takeScreenshot,runTest}}}).mount('#app');
 </script>
 </body>
 </html>

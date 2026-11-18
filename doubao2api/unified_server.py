@@ -2151,6 +2151,108 @@ def create_app(
         except Exception as exc:
             log.error("QR login error: %s", exc)
 
+    _browser_login_watch: Dict[str, bool] = {"running": False}
+
+    async def _watch_in_browser_login(client: BrowserClient, timeout: int = 180) -> None:
+        """Wait for the in-browser login dialog to disappear, then re-init state."""
+        if _browser_login_watch.get("running"):
+            return
+        _browser_login_watch["running"] = True
+        try:
+            for _ in range(timeout * 2):
+                await asyncio.sleep(0.5)
+                page = client.page
+                if page is None:
+                    return
+                if client.is_ready:
+                    return
+                try:
+                    count = await page.locator('button:has-text("登录")').count()
+                except Exception:
+                    continue
+                if count == 0:
+                    await asyncio.sleep(1.5)
+                    await client._check_login_state()
+                    log.info(
+                        "In-browser QR login finished, ready=%s", client.is_ready
+                    )
+                    return
+            log.warning("In-browser QR login wait timed out")
+        except Exception as exc:
+            log.error("In-browser login watch failed: %s", exc)
+        finally:
+            _browser_login_watch["running"] = False
+
+    @app.get("/auth/login-qr")
+    async def auth_login_qr(request: Request):
+        """Open the official in-browser login dialog and return its QR code.
+
+        The pure-HTTP QR flow (``/v1/session/qr-login``) returns a short-link
+        QR that some Doubao App versions fail to open; this endpoint instead
+        captures the canonical web-login QR rendered by doubao.com itself.
+        """
+        _check_auth(request)
+        client = _browser.get("client")
+        if client is None or client.page is None:
+            raise HTTPException(status_code=503, detail="Browser not available")
+        if client.is_ready:
+            return JSONResponse({"status": "already_logged_in"})
+
+        page = client.page
+        qr_selector = '[class*="qrcode"]'
+        try:
+            if await page.locator(qr_selector).count() == 0:
+                # Close promotional dialogs that may intercept pointer events.
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                clicked = await page.evaluate(
+                    """() => {
+                        const btn = document.querySelector('[data-testid="to_login_button"]')
+                            || [...document.querySelectorAll('button')]
+                                 .find(b => (b.textContent || '').trim() === '登录');
+                        if (!btn) return false;
+                        btn.click();
+                        return true;
+                    }"""
+                )
+                if not clicked:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Login button not found (page may still be loading)",
+                    )
+                for _ in range(12):
+                    await asyncio.sleep(0.5)
+                    if await page.locator(qr_selector).count() > 0:
+                        break
+            if await page.locator(qr_selector).count() == 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Login QR dialog did not appear, please retry",
+                )
+            png = await page.locator(qr_selector).first.screenshot(type="png")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.error("Capture in-browser login QR failed: %s", exc)
+            raise HTTPException(
+                status_code=503, detail=f"Could not capture login QR: {exc}"
+            ) from exc
+
+        # Watch for the scan to complete so the client becomes ready.
+        asyncio.create_task(_watch_in_browser_login(client))
+
+        import base64 as _b64
+
+        return JSONResponse({
+            "status": "qr_ready",
+            "source": "browser",
+            "qr_image_base64": _b64.b64encode(png).decode(),
+            "message": "请用豆包 App 扫描此二维码（官方网页登录二维码）",
+        })
+
     @app.get("/auth/status")
     async def auth_status(request: Request):
         return await _get_login_status(request)
