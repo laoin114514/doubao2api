@@ -25,6 +25,7 @@ venv/
 
 # Generated artifacts
 doubao_qr_login.png
+qr.png
 server_out.txt
 server_err.txt
 testpic.webp

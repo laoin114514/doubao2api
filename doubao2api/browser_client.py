@@ -17,6 +17,7 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -103,6 +104,27 @@ class BrowserClient:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _clear_stale_profile_locks(user_data_dir: str) -> None:
+        """Remove Chromium profile lock files left by an abrupt shutdown.
+
+        Docker recreates/restarts the container while the mounted ./profile
+        volume still contains SingletonLock/SingletonCookie/SingletonSocket
+        pointing at the *old* container's hostname+PID. Chromium then refuses
+        to launch with "profile appears to be in use by another process".
+        The profile is exclusively owned by this single service instance, so
+        removing the stale links is safe.
+        """
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock_path = Path(user_data_dir) / name
+            try:
+                lock_path.unlink()
+                log.warning("Removed stale Chromium profile lock: %s", lock_path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log.warning("Could not remove stale profile lock %s: %s", lock_path, exc)
+
     async def start(self):
         """Launch browser, navigate to Doubao, init httpx client."""
         log.info("Starting BrowserClient (headless=%s)", self.headless)
@@ -116,6 +138,7 @@ class BrowserClient:
         ]
 
         if self.user_data_dir:
+            self._clear_stale_profile_locks(self.user_data_dir)
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
                 headless=self.headless,

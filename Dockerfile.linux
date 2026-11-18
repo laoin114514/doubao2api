@@ -70,4 +70,6 @@ ENV DOUBAO_BROWSER_DATA=/app/profile
 EXPOSE 9090
 
 # 6. 启动：xvfb-run 提供虚拟 X 显示，浏览器保持「有头」指纹
-CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1280x900x24' python -m doubao2api"]
+#    使用 exec 让 xvfb-run 成为 PID 1，docker stop 的 SIGTERM 才能传递到
+#    python/uvicorn 触发 lifespan shutdown（优雅关闭 Chromium，避免 profile 锁残留）
+CMD ["sh", "-c", "exec xvfb-run -a -s '-screen 0 1280x900x24' python -m doubao2api"]

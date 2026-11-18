@@ -20,6 +20,8 @@ services:
         PLAYWRIGHT_HOST: "${PLAYWRIGHT_HOST:-https://cdn.npmmirror.com/binaries/playwright}"
     container_name: doubao2api
     restart: unless-stopped
+    # 用 tini 作为 PID 1 转发信号，保证 docker stop 时能优雅关闭 Chromium
+    init: true
     ports:
       # 宿主机端口从 .env 读取（默认 9090）
       - "${DOUBAO_PORT:-9090}:${DOUBAO_PORT:-9090}"
