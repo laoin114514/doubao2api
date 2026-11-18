@@ -23,8 +23,10 @@ services:
     # 用 tini 作为 PID 1 转发信号，保证 docker stop 时能优雅关闭 Chromium
     init: true
     ports:
-      # 宿主机端口从 .env 读取（默认 9090）
+      # 宿主机端口从 .env 读取（默认 9090/9091）
       - "${DOUBAO_PORT:-9090}:${DOUBAO_PORT:-9090}"
+      # noVNC（DOUBAO_ENABLE_VNC=true 时容器内才真正监听 6080）
+      - "${DOUBAO_NOVNC_PORT:-6080}:6080"
     volumes:
       # 登录态持久化（重要：容器重建后不丢失）
       - ./profile:/app/profile
@@ -39,7 +41,10 @@ services:
       # ↓↓↓ 必填：务必在 .env 中设置随机密钥，生成方式: openssl rand -hex 32
       # 未设置时 compose 会直接报错退出（避免以无鉴权方式暴露到公网）
       DOUBAO_API_KEY: "${DOUBAO_API_KEY:?please set DOUBAO_API_KEY in .env (openssl rand -hex 32)}"
-      # noVNC（可选）：容器本身不跑 noVNC，需在宿主机另起 x11vnc/noVNC 时再填
+      # noVNC（可选）：DOUBAO_ENABLE_VNC=true 时容器内启动 Xvfb+x11vnc+noVNC，
+      # 浏览器画面可通过 http://<host>:6080/vnc.html 查看/操作（风险：等于暴露登录态浏览器）
+      DOUBAO_ENABLE_VNC: "${DOUBAO_ENABLE_VNC:-false}"
+      DOUBAO_VNC_PASSWORD: "${DOUBAO_VNC_PASSWORD:-}"
       DOUBAO_NOVNC_URL: "${DOUBAO_NOVNC_URL:-}"
       DOUBAO_NOVNC_PASSWORD: "${DOUBAO_NOVNC_PASSWORD:-}"
       # 安全相关（默认收紧）

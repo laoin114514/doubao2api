@@ -1045,8 +1045,11 @@ server {
 | `DOUBAO_HEADLESS` | `true` | Chromium 是否无头运行（Linux Docker 用 xvfb 保持有头指纹） |
 | `DOUBAO_BROWSER_DATA` | `~/.doubao_browser` | Chromium 持久化用户目录（登录态所在） |
 | `DOUBAO_COOKIE` | 空 | 直接注入 Cookie 头（`sessionid=...; ttwid=...`），优先于 session 文件 |
-| `DOUBAO_NOVNC_URL` | 自动推断 | Admin 面板中的 noVNC 地址 |
-| `DOUBAO_NOVNC_PASSWORD` | 空 | 自动拼接到 noVNC URL 的密码参数 |
+| `DOUBAO_ENABLE_VNC` | `false` | 容器内是否启动 noVNC（Xvfb+x11vnc+websockify），用于网页查看/操作浏览器 |
+| `DOUBAO_VNC_PASSWORD` | 空 | x11vnc 连接密码（开启 VNC 时强烈建议设置） |
+| `DOUBAO_NOVNC_PASSWORD` | 空 | Admin 面板 iframe URL 自动填充的 noVNC 密码（一般与 VNC 密码相同） |
+| `DOUBAO_NOVNC_URL` | 自动推断 | Admin 面板中的 noVNC 地址（留空 = `http://<host>:6080/vnc.html`） |
+| `DOUBAO_NOVNC_PORT` | `6080` | noVNC 宿主机映射端口 |
 | `DOUBAO_CORS_ORIGINS` | 空 | 允许跨域的 Origin 列表（逗号分隔）；默认空 = 不发送 CORS 响应头 |
 | `DOUBAO_ENABLE_ADMIN_DEBUG` | `false` | 管理调试开关：开启后才允许 `POST /auth/eval` 与 `/admin/api/cookies` 导出明文 Cookie |
 | `DOUBAO_ALLOW_PRIVATE_FILE_URLS` | `false` | 允许远程 `file_url` 下载内网/私有地址（默认关闭，防 SSRF） |
@@ -1077,7 +1080,9 @@ Authorization: Bearer your-api-key
 
 **浏览器 watchdog**：后台每 30 秒检查浏览器是否响应，如果 Chromium 进程异常会自动重启。
 
-**风控处理**：如果接口返回 `710022004`，服务会在 `/health` 中标记 `needs_captcha=true`，此时需要通过 noVNC 或重新登录处理风控，再调用 `/auth/reset_captcha` 恢复服务。
+**风控处理**：如果接口返回 `710022004`（验证码），服务会在 `/health` 中标记 `needs_captcha=true`，此时可通过 Admin 登录页的 noVNC 直接在浏览器里完成验证，再调用 `/auth/reset_captcha` 恢复服务。（`rate limited` 类限流不会再标记 needs_captcha，服务会进入本地冷却并返回 429。）
+
+> ⚠️ 开启 `DOUBAO_ENABLE_VNC=true` 后，noVNC（默认 6080 端口）等于暴露一个**已登录豆包账号的完整浏览器**。务必设置 `DOUBAO_VNC_PASSWORD`，并只通过内网/SSH 隧道访问，不要直接暴露公网。
 
 **首次部署 Session 获取**：
 
@@ -1106,7 +1111,7 @@ curl http://localhost:9090/v1/session/qr-login \
 | 页面 | 功能 |
 |------|------|
 | **概览** | Session 状态、系统配置、Cookie 详情表格、测活按钮 |
-| **登录** | QR 扫码登录、noVNC 手动登录、浏览器截图 |
+| **登录** | 官方浏览器扫码登录（推荐）、API 二维码（备用）、noVNC 手动操作、浏览器截图 |
 | **API 测试** | 选择模型发送请求，支持流式/非流式，思维链折叠展示 |
 | **请求日志** | 最近 100 条请求记录（5s 自动刷新） |
 

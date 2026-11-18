@@ -29,6 +29,7 @@ FROM python:3.12-slim
 #    注意：libatomic1 是 Playwright 自带 node 的运行时依赖，新版 python:slim
 #    基础镜像已不再默认包含，缺失会导致 `playwright install` 报
 #    "libatomic.so.1: cannot open shared object file"（必须在安装浏览器前装上）。
+#    x11vnc + noVNC：可选，用于在网页里直接操作/看浏览器（DOUBAO_ENABLE_VNC=true）。
 ARG APT_MIRROR
 ARG PIP_MIRROR
 ARG PLAYWRIGHT_HOST
@@ -38,6 +39,9 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         xvfb \
         xauth \
+        x11vnc \
+        novnc \
+        python3-websockify \
         fonts-noto-cjk \
         libatomic1 \
         ca-certificates \
@@ -54,8 +58,10 @@ RUN pip install --no-cache-dir -i ${PIP_MIRROR} -r requirements.txt
 ENV PLAYWRIGHT_DOWNLOAD_HOST=${PLAYWRIGHT_HOST}
 RUN python -m playwright install --with-deps chromium
 
-# 4. 项目代码
+# 4. 项目代码 + 容器入口脚本
 COPY doubao2api/ doubao2api/
+COPY docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # 5. 服务配置
 ENV DOUBAO_HOST=0.0.0.0
@@ -64,12 +70,14 @@ ENV DOUBAO_PORT=9090
 ENV DOUBAO_HEADLESS=false
 # 登录态目录（compose 中挂载卷，持久化）
 ENV DOUBAO_BROWSER_DATA=/app/profile
+# 可选 VNC（默认关闭；开启后浏览器画面通过 noVNC :6080 暴露，风险较高）
+ENV DOUBAO_ENABLE_VNC=false
 # API 鉴权密钥：不设默认值，必须通过 compose/.env 注入；
 # 留空时代码会以“无鉴权”启动并打印醒目警告（不建议暴露公网）。
 
 EXPOSE 9090
+# noVNC（仅 DOUBAO_ENABLE_VNC=true 时实际监听）
+EXPOSE 6080
 
-# 6. 启动：xvfb-run 提供虚拟 X 显示，浏览器保持「有头」指纹
-#    使用 exec 让 xvfb-run 成为 PID 1，docker stop 的 SIGTERM 才能传递到
-#    python/uvicorn 触发 lifespan shutdown（优雅关闭 Chromium，避免 profile 锁残留）
-CMD ["sh", "-c", "exec xvfb-run -a -s '-screen 0 1280x900x24' python -m doubao2api"]
+# 6. 启动：默认 xvfb-run；开启 VNC 时由 entrypoint 启动 Xvfb + x11vnc + noVNC
+CMD ["/app/entrypoint.sh"]
