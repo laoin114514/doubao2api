@@ -41,7 +41,9 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries \
 
 WORKDIR /app
 
-# 2. Python 依赖（走国内 pip 镜像；playwright/httpx 已在 requirements.txt 中）
+# 2. Python 依赖（先拷贝依赖清单再安装，利用 Docker layer 缓存；
+#    requirements.txt 必须先进镜像，否则 pip 找不到文件）
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -i ${PIP_MIRROR} -r requirements.txt
 
 # 3. 安装 chromium（--with-deps 自动补齐 nss/atk/gbm 等系统库，走国内镜像下载）
