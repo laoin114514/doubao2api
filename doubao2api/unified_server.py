@@ -422,6 +422,22 @@ def create_app(
 
     app = FastAPI(title="Doubao API", version="1.0.0", lifespan=lifespan)
 
+    # Serve vendored admin assets locally (Vue/Tailwind) so the console works
+    # even when the browser cannot reach external CDNs.
+    from pathlib import Path as _Path
+
+    from fastapi.staticfiles import StaticFiles as _StaticFiles
+
+    _vendor_dir = _Path(__file__).parent / "static" / "vendor"
+    if _vendor_dir.is_dir():
+        app.mount(
+            "/static/vendor",
+            _StaticFiles(directory=_vendor_dir),
+            name="admin-vendor",
+        )
+    else:
+        log.warning("Admin vendor assets not found at %s", _vendor_dir)
+
     @app.exception_handler(HTTPException)
     async def _http_exc(request: Request, exc: HTTPException):
         return JSONResponse(
