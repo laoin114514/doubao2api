@@ -41,11 +41,8 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries \
 
 WORKDIR /app
 
-# 2. Python 依赖（走国内 pip 镜像）
-RUN pip install --no-cache-dir -i ${PIP_MIRROR} \
-        -r requirements.txt \
-        playwright \
-        playwright-stealth
+# 2. Python 依赖（走国内 pip 镜像；playwright/httpx 已在 requirements.txt 中）
+RUN pip install --no-cache-dir -i ${PIP_MIRROR} -r requirements.txt
 
 # 3. 安装 chromium（--with-deps 自动补齐 nss/atk/gbm 等系统库，走国内镜像下载）
 ENV PLAYWRIGHT_DOWNLOAD_HOST=${PLAYWRIGHT_HOST}
@@ -61,8 +58,8 @@ ENV DOUBAO_PORT=9090
 ENV DOUBAO_HEADLESS=false
 # 登录态目录（compose 中挂载卷，持久化）
 ENV DOUBAO_BROWSER_DATA=/app/profile
-# API 鉴权密钥（部署时通过 compose 注入，务必设置！）
-ENV DOUBAO_API_KEY=change-me
+# API 鉴权密钥：不设默认值，必须通过 compose/.env 注入；
+# 留空时代码会以“无鉴权”启动并打印醒目警告（不建议暴露公网）。
 
 EXPOSE 9090
 

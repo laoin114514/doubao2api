@@ -18,11 +18,10 @@ No login required for basic usage (temporary sessions).
 import asyncio
 import json
 import logging
-import time
 import uuid
-from typing import AsyncGenerator, Optional, Dict, Any
+from typing import Any, AsyncGenerator, Dict, Optional
 
-from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
 log = logging.getLogger(__name__)
@@ -145,7 +144,14 @@ class QianwenClient:
 
     async def stop(self):
         """Close browser."""
+        for queue in list(self._stream_queues.values()):
+            try:
+                queue.put_nowait("__ERROR__:Qianwen client stopped")
+            except Exception:
+                pass
+        self._stream_queues.clear()
         self._ready = False
+        self._bridge_ready = False
         if self._context:
             await self._context.close()
         if self._playwright:
@@ -279,6 +285,11 @@ class QianwenClient:
         content: str, model: str, deep_search: str,
     ):
         """Execute fetch() inside browser and stream via callback."""
+        if not self._bridge_ready:
+            raise RuntimeError(
+                "Qianwen stream bridge is not registered; refusing to issue a "
+                "request that would time out"
+            )
         await self._page.evaluate(
             self._FETCH_JS,
             [req_id, sess_id, topic_id, content, model, deep_search, self._device_id],
@@ -336,6 +347,24 @@ class QianwenClient:
             )
         )
 
+        def _on_fetch_task_done(task: "asyncio.Task") -> None:
+            """Surface early browser-fetch failures instead of waiting for timeout."""
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                return
+            log.error("Qianwen fetch task failed: %s", exc)
+            q = self._stream_queues.get(req_id)
+            if q is not None:
+                try:
+                    q.put_nowait(f"__ERROR__:browser fetch failed: {exc}")
+                except Exception:
+                    pass
+
+        eval_task.add_done_callback(_on_fetch_task_done)
+
+        had_error = False
         try:
             while True:
                 chunk = await asyncio.wait_for(queue.get(), timeout=120)
@@ -345,6 +374,7 @@ class QianwenClient:
                     error_msg = chunk[10:]
                     log.error("Browser fetch error: %s", error_msg[:200])
                     self.record_failure()
+                    had_error = True
                     yield {"error": True, "message": error_msg}
                     break
                 if chunk.startswith("__HTTP_ERROR__:"):
@@ -353,6 +383,7 @@ class QianwenClient:
                     body = parts[1] if len(parts) > 1 else ""
                     log.error("Qianwen API error %d: %s", status, body[:200])
                     self.record_failure()
+                    had_error = True
                     yield {"error": True, "status": status, "message": body}
                     break
                 # Parse JSON
@@ -366,6 +397,7 @@ class QianwenClient:
         except asyncio.TimeoutError:
             log.error("Stream timeout (120s) for request %s", req_id)
             self.record_failure()
+            had_error = True
             yield {"error": True, "message": "Stream timeout"}
         finally:
             self._stream_queues.pop(req_id, None)
@@ -376,6 +408,9 @@ class QianwenClient:
                     eval_task.result()
                 except Exception:
                     pass
+
+        if not had_error:
+            self.record_success()
 
     # ------------------------------------------------------------------
     # High-level helpers

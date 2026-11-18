@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hmac
+import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -29,22 +33,20 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .browser_client import BrowserClient
-from .qianwen_client import QianwenClient, QIANWEN_MODELS
+from .qianwen_client import QIANWEN_MODELS, QianwenClient
+from .token_counter import SAFETY_FACTOR, count_messages_tokens, count_tokens
 from .tool_calling import (
-    build_tool_system_prompt,
-    convert_messages_with_tools,
-    parse_tool_calls_xml,
-    is_tool_call_start,
-    has_complete_tool_calls,
-    StreamingGuard,
-    detect_truncated_tool_call,
-    build_continuation_prompt,
-    filter_history_by_topic,
     ToolNameObfuscator,
+    build_continuation_prompt,
     coerce_tool_arguments,
+    convert_messages_with_tools,
     deduplicate_continuation,
+    detect_truncated_tool_call,
+    filter_history_by_topic,
+    has_complete_tool_calls,
+    is_tool_call_start,
+    parse_tool_calls_xml,
 )
-from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
 
 log = logging.getLogger("doubao_unified")
 
@@ -76,6 +78,93 @@ ALL_MODELS = [
     {"id": "doubao-music", "object": "model", "owned_by": "doubao", "created": 0},
     {"id": "doubao-video", "object": "model", "owned_by": "doubao", "created": 0},
 ]
+
+
+# ── Security / feature configuration (env) ───────────────────
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Admin debug endpoints (/auth/eval, raw cookie export) are dangerous; opt-in only.
+ADMIN_DEBUG = _env_bool("DOUBAO_ENABLE_ADMIN_DEBUG", False)
+# Wildcard CORS is no longer enabled by default; opt-in via comma-separated origins.
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("DOUBAO_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+# SSRF guard for remote file_url downloads (private/loopback/link-local blocked).
+ALLOW_PRIVATE_FILE_URLS = _env_bool("DOUBAO_ALLOW_PRIVATE_FILE_URLS", False)
+FILE_URL_MAX_MB = max(1, _env_int("DOUBAO_FILE_URL_MAX_MB", 50))
+
+
+def _host_is_private(host: str) -> bool:
+    """Resolve a hostname and report whether it points to a non-public address."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        return True  # Unresolvable: refuse instead of failing open
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return True
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+async def _assert_public_http_url(url: str) -> None:
+    """Reject remote URLs that target internal/private networks (SSRF guard)."""
+    if ALLOW_PRIVATE_FILE_URLS:
+        return
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail=f"Unsupported file_url scheme: {parsed.scheme}")
+    host = parsed.hostname or ""
+    if not host:
+        raise HTTPException(status_code=400, detail="file_url is missing a hostname")
+    loop = asyncio.get_running_loop()
+    private = await loop.run_in_executor(None, _host_is_private, host)
+    if private:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "file_url resolves to a private/internal address and was rejected. "
+                "Set DOUBAO_ALLOW_PRIVATE_FILE_URLS=true to override (not recommended)."
+            ),
+        )
+
+
+def _extract_tool_names(tools: Optional[list]) -> set[str]:
+    """Return the function names declared by an OpenAI tools array."""
+    names: set[str] = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        name = (tool.get("function") or {}).get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
 
 
 # ── Expert Mode Quota Tracker ──
@@ -228,9 +317,16 @@ def create_app(
 
     _browser: Dict[str, Any] = {}  # holds BrowserClient instance
     _qianwen: Dict[str, Any] = {}  # holds QianwenClient instance
+    # Recovery state for the watchdog: avoid restart loops on an expired login.
+    _recovery: Dict[str, Any] = {"attempts": 0, "last": 0.0}
 
     async def _browser_watchdog():
-        """Background task: check browser health every 30s, auto-restart on crash."""
+        """Background task: check browser health every 30s, auto-restart on crash.
+
+        Also recovers from the "5 consecutive failures -> not ready" deadlock:
+        if the browser process is alive but the client is marked not-ready
+        without a captcha flag, attempt a bounded number of restarts.
+        """
         while True:
             await asyncio.sleep(30)
             client = _browser.get("client")
@@ -243,8 +339,30 @@ def create_app(
                     await client.restart()
                     if client.is_ready:
                         log.info("Browser watchdog: restart successful")
+                        _recovery["attempts"] = 0
                     else:
                         log.warning("Browser watchdog: restarted but not logged in")
+                    continue
+
+                if client.is_ready or client.needs_captcha:
+                    _recovery["attempts"] = 0
+                    continue
+
+                # Alive, not ready, no captcha flag -> likely stuck failure trail.
+                now = time.time()
+                if _recovery["attempts"] >= 3 or now - _recovery["last"] < 300:
+                    continue
+                _recovery["attempts"] += 1
+                _recovery["last"] = now
+                log.warning(
+                    "Browser watchdog: not ready without captcha flag, "
+                    "recovery restart attempt %d/3",
+                    _recovery["attempts"],
+                )
+                await client.restart()
+                if client.is_ready:
+                    log.info("Browser watchdog: recovery restart successful")
+                    _recovery["attempts"] = 0
             except Exception as e:
                 log.error("Browser watchdog error: %s", e)
 
@@ -319,12 +437,16 @@ def create_app(
             content={"error": {"message": str(exc), "type": "internal_error", "code": 500}},
         )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if CORS_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=CORS_ORIGINS,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type"],
+            allow_credentials=False,
+        )
+    else:
+        log.info("CORS disabled (set DOUBAO_CORS_ORIGINS to enable cross-origin access)")
 
     bucket = _TokenBucket(rpm_limit)
 
@@ -341,7 +463,7 @@ def create_app(
             if not token:
                 raise HTTPException(status_code=401, detail="API key required")
             return
-        if token != api_key:
+        if not hmac.compare_digest(token, api_key):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
     def _get_client() -> BrowserClient:
@@ -441,8 +563,9 @@ def create_app(
         """
         import base64
         import mimetypes
-        from urllib.parse import urlparse
+
         files: list[dict[str, Any]] = []
+        max_bytes = FILE_URL_MAX_MB * 1024 * 1024
 
         def _is_image(mime_type: str, fname: str) -> bool:
             if mime_type.startswith("image/"):
@@ -485,17 +608,36 @@ def create_app(
                     ext = mimetypes.guess_extension(mime_type) or ".txt"
                     name = f"upload{ext}"
             elif url.startswith("http://") or url.startswith("https://"):
+                # SSRF guard: only public HTTP(S) endpoints unless explicitly overridden.
+                await _assert_public_http_url(url)
                 parsed = urlparse(url)
                 inferred_name = parsed.path.rsplit("/", 1)[-1] or "downloaded_file"
                 if name == "file":
                     name = inferred_name
-                async with httpx.AsyncClient(timeout=120) as http_client:
+                async with httpx.AsyncClient(timeout=120, follow_redirects=False) as http_client:
                     response = await http_client.get(url)
+                    if response.is_redirect:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="file_url redirects are not followed",
+                        )
                     response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > max_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"file too large (max {FILE_URL_MAX_MB} MB)",
+                        )
                     file_data = response.content
                 mime_type = response.headers.get("content-type", "") or ""
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported file_url: {url[:80]}")
+
+            if len(file_data) > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"file too large (max {FILE_URL_MAX_MB} MB)",
+                )
 
             if _is_image(mime_type, name):
                 files.append(await _image_attachment(file_data, name))
@@ -549,55 +691,74 @@ def create_app(
     async def chat_completions(body: ChatCompletionRequest, request: Request):
         _check_auth(request)
 
-        # ── Route to Qianwen if model matches ──
-        if body.model in QIANWEN_MODEL_NAMES:
+        # ── Route resolution (validate before consuming rate-limit tokens) ──
+        is_qianwen = body.model in QIANWEN_MODEL_NAMES
+        has_tools = bool(body.tools)
+        file_refs: list[dict[str, Any]] = []
+        prompt = ""
+        use_deep_think = 0
+        model_name = body.model
+        valid_tool_names: Optional[set[str]] = None
+
+        if not is_qianwen:
+            if has_tools:
+                # Doubao web models cannot call tools natively: emulate function
+                # calling with a prompt-injected XML protocol, using expert mode
+                # (auto-falling back to think when expert quota is degraded).
+                _, tool_file_refs = _extract_prompt_and_file_refs(body.messages)
+                if tool_file_refs:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="File/image attachments are not supported together with tools",
+                    )
+                requested_deep_think = CHAT_MODELS["doubao-expert"]
+                use_deep_think, effective_name = _expert_tracker.get_effective_mode(
+                    requested_deep_think
+                )
+                if effective_name != "doubao-expert":
+                    log.info("Expert mode degraded, using %s for tool calling", effective_name)
+                messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
+                prompt = convert_messages_with_tools(messages_raw, body.tools)
+                valid_tool_names = _extract_tool_names(body.tools) or None
+            else:
+                use_deep_think = CHAT_MODELS.get(body.model)
+                if use_deep_think is None:
+                    all_models = list(CHAT_MODELS.keys()) + list(QIANWEN_MODEL_NAMES)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown model '{body.model}'. Available: {', '.join(all_models)}",
+                    )
+                prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
+                if not prompt:
+                    raise HTTPException(status_code=400, detail="No text content")
+
+        # Rate-limit both backends consistently (Qianwen used to bypass the bucket).
+        await bucket.acquire()
+
+        if is_qianwen:
             return await _handle_qianwen_chat(body, request)
 
-        # ── Tool calling mode ──
-        has_tools = bool(body.tools)
-        if has_tools:
-            # Use expert model for tool calling, with auto-fallback to think if degraded
-            requested_deep_think = CHAT_MODELS["doubao-expert"]
-            use_deep_think, model_name = _expert_tracker.get_effective_mode(requested_deep_think)
-            # Convert messages with tool definitions injected
-            messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
-            prompt = convert_messages_with_tools(messages_raw, body.tools)
-        else:
-            use_deep_think = CHAT_MODELS.get(body.model)
-            if use_deep_think is None:
-                all_models = list(CHAT_MODELS.keys()) + list(QIANWEN_MODEL_NAMES)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown model '{body.model}'. Available: {', '.join(all_models)}",
-                )
-            model_name = body.model
-            prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
-            if not prompt:
-                raise HTTPException(status_code=400, detail="No text content")
-
-        await bucket.acquire()
         client = _get_client()
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         if body.stream:
-            if not has_tools:
-                _, file_refs_check = _extract_prompt_and_file_refs(body.messages)
-                if file_refs_check:
-                    # 带附件（图片/文件）的流式请求：收集全文后用 SSE 一次性返回，
-                    # 避免直接 400（客户端如 ZCode 默认 stream=true 发图）
-                    return StreamingResponse(
-                        _stream_collect_with_files(client, prompt, use_deep_think,
-                                                   request_id, model_name,
-                                                   file_refs_check,
-                                                   conversation_id=body.conversation_id,
-                                                   bot_id=body.bot_id),
-                        media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                    )
+            if not has_tools and file_refs:
+                # 带附件（图片/文件）的流式请求：收集全文后用 SSE 一次性返回，
+                # 避免直接 400（客户端如 ZCode 默认 stream=true 发图）
+                return StreamingResponse(
+                    _stream_collect_with_files(client, prompt, use_deep_think,
+                                               request_id, model_name,
+                                               file_refs,
+                                               conversation_id=body.conversation_id,
+                                               bot_id=body.bot_id),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
             return StreamingResponse(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
                              conversation_id=body.conversation_id, bot_id=body.bot_id,
                              has_tools=has_tools,
+                             valid_tool_names=valid_tool_names,
                              messages_for_counting=body.messages),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -615,15 +776,23 @@ def create_app(
                 had_reasoning = bool(message.get("reasoning_content"))
                 if use_deep_think >= 1:
                     _expert_tracker.report_response(had_reasoning)
-                # Check if response contains tool calls
+                # Check if response contains tool calls (whitelist guards
+                # against hallucinated tool names).
                 content = message.get("content", "")
-                parsed_tools = parse_tool_calls_xml(content) if content else None
+                parsed_tools = (
+                    parse_tool_calls_xml(content, valid_tool_names=valid_tool_names)
+                    if content
+                    else None
+                )
                 if parsed_tools:
-                    message = {
+                    tool_message: Dict[str, Any] = {
                         "role": "assistant",
                         "content": None,
                         "tool_calls": parsed_tools,
                     }
+                    if message.get("reasoning_content"):
+                        tool_message["reasoning_content"] = message["reasoning_content"]
+                    message = tool_message
                     finish_reason = "tool_calls"
                 else:
                     finish_reason = "stop"
@@ -632,7 +801,7 @@ def create_app(
                 images = [f for f in files if f.get("is_image")]
                 if images:
                     # 图片对话走官方 client 库路径（/chat/completion 图片附件实测不被识别）
-                    from .client import DoubaoChatClient, EXTENSION_BOT_ID
+                    from .client import EXTENSION_BOT_ID, DoubaoChatClient
                     async with DoubaoChatClient(
                         cookies=await client.get_cookies_dict(),
                         ms_token=client._ms_token or "",
@@ -665,6 +834,7 @@ def create_app(
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
 
         # max_tokens truncation (non-streaming only)
@@ -727,6 +897,7 @@ def create_app(
 
         # ── Tool calling: inject tool definitions into prompt ──
         has_tools = bool(body.tools)
+        valid_tool_names: Optional[set[str]] = None
         if has_tools:
             # Log input breakdown for debugging
             num_tools = len(body.tools) if body.tools else 0
@@ -739,6 +910,8 @@ def create_app(
             # Obfuscate tool names if enabled (avoids Qwen built-in validation)
             tools_for_prompt = _tool_obfuscator.obfuscate_tools(body.tools)
             prompt = convert_messages_with_tools(messages_raw, tools_for_prompt)
+            # Whitelist must match the names the model actually sees.
+            valid_tool_names = _extract_tool_names(tools_for_prompt) or None
             log.info("Qianwen prompt after flatten: %d chars (%dKB)",
                      len(prompt), len(prompt) // 1024)
             if len(prompt) > 50000:
@@ -753,6 +926,7 @@ def create_app(
                 _stream_qianwen_chat(
                     qw_client, messages_for_qw, qw_model, deep_search,
                     request_id, body.model, has_tools=has_tools,
+                    valid_tool_names=valid_tool_names,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -777,10 +951,12 @@ def create_app(
             # Check for tool calls in think_content first, then content
             if has_tools:
                 source = think_content if think_content else content
-                parsed = parse_tool_calls_xml(source)
+                parsed = parse_tool_calls_xml(source, valid_tool_names=valid_tool_names)
                 if not parsed and content:
-                    parsed = parse_tool_calls_xml(content)
-                
+                    parsed = parse_tool_calls_xml(
+                        content, valid_tool_names=valid_tool_names
+                    )
+
                 # Auto-continue if tool call was truncated
                 if not parsed and detect_truncated_tool_call(source or content):
                     log.info("Detected truncated tool_call, attempting continuation...")
@@ -792,17 +968,26 @@ def create_app(
                         cont_content = _think_prefix_re.sub("", cont_content).strip()
                         # Deduplicate overlap before combining
                         combined = deduplicate_continuation(source or content, cont_content)
-                        parsed = parse_tool_calls_xml(combined)
+                        parsed = parse_tool_calls_xml(
+                            combined, valid_tool_names=valid_tool_names
+                        )
                         if parsed:
                             log.info("Continuation successful, got %d tool calls", len(parsed))
                     except Exception as e:
                         log.warning("Continuation failed: %s", e)
-                
+
                 if parsed:
                     # Deobfuscate tool names back to original
                     parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
                     # Coerce parameter names to match schema
                     parsed = coerce_tool_arguments(parsed)
+                    tool_message: Dict[str, Any] = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": parsed,
+                    }
+                    if think_content:
+                        tool_message["reasoning_content"] = think_content
                     return JSONResponse({
                         "id": request_id,
                         "object": "chat.completion",
@@ -810,11 +995,7 @@ def create_app(
                         "model": result.get("model", body.model),
                         "choices": [{
                             "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": parsed,
-                            },
+                            "message": tool_message,
                             "finish_reason": "tool_calls",
                         }],
                         "usage": {
@@ -855,6 +1036,7 @@ def create_app(
         model_name: str,
         *,
         has_tools: bool = False,
+        valid_tool_names: Optional[set[str]] = None,
     ):
         """Generate OpenAI-compatible SSE stream from Qianwen's cumulative format.
 
@@ -895,11 +1077,19 @@ def create_app(
         try:
             async for event in qw_client.chat_stream(messages, model, deep_search):
                 if event.get("error"):
-                    err_chunk = _make_chunk(
-                        {"content": f"[Error: {event.get('message', 'unknown')}]"}
-                    )
-                    yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
-                    break
+                    message = event.get("message", "unknown")
+                    log.error("Qianwen stream error: %s", message)
+                    qw_client.record_failure()
+                    err = {
+                        "error": {
+                            "message": str(message),
+                            "type": "upstream_error",
+                            "code": 502,
+                        }
+                    }
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
                 data = event.get("data", {})
                 msgs = data.get("messages", [])
@@ -956,18 +1146,32 @@ def create_app(
 
         except Exception as e:
             log.error("Qianwen stream error: %s", e)
-            err_chunk = _make_chunk({"content": f"[Stream error: {e}]"})
-            yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+            qw_client.record_failure()
+            err = {
+                "error": {
+                    "message": f"Stream error: {e}",
+                    "type": "upstream_error",
+                    "code": 502,
+                }
+            }
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Stream completed successfully
+        qw_client.record_success()
 
         # After stream ends: check for tool calls in both content and think_content
         if has_tools and (tool_mode or full_think or full_content):
             # Try think_content first (thinking mode puts tool calls there)
             source = full_think if full_think else full_content
-            parsed = parse_tool_calls_xml(source)
+            parsed = parse_tool_calls_xml(source, valid_tool_names=valid_tool_names)
             # Also try main content if think didn't have it
             if not parsed and full_content:
-                parsed = parse_tool_calls_xml(full_content)
-            
+                parsed = parse_tool_calls_xml(
+                    full_content, valid_tool_names=valid_tool_names
+                )
+
             # Auto-continue if truncated
             if not parsed and detect_truncated_tool_call(source or full_content):
                 log.info("Stream: detected truncated tool_call, attempting continuation...")
@@ -978,12 +1182,14 @@ def create_app(
                     cont_content = cont_result.get("content", "")
                     # Deduplicate overlap before combining
                     combined = deduplicate_continuation(source or full_content, cont_content)
-                    parsed = parse_tool_calls_xml(combined)
+                    parsed = parse_tool_calls_xml(
+                        combined, valid_tool_names=valid_tool_names
+                    )
                     if parsed:
                         log.info("Stream continuation got %d tool calls", len(parsed))
                 except Exception as e:
                     log.warning("Stream continuation failed: %s", e)
-            
+
             if parsed:
                 # Deobfuscate tool names back to original
                 parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
@@ -1029,6 +1235,7 @@ def create_app(
                 ref_image_key=body.ref_image_key,
             )
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
 
         images = result.get("images", [])
@@ -1036,6 +1243,7 @@ def create_app(
             raise HTTPException(
                 status_code=502, detail="No images generated"
             )
+        client.record_success()
 
         data = []
         for img in images:
@@ -1068,6 +1276,7 @@ def create_app(
                 genre=body.get("genre"),
             )
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
 
         tracks = result.get("tracks", [])
@@ -1075,6 +1284,7 @@ def create_app(
             raise HTTPException(
                 status_code=502, detail="No music tracks generated"
             )
+        client.record_success()
 
         return JSONResponse({
             "created": int(time.time()),
@@ -1101,14 +1311,17 @@ def create_app(
                 prompt=prompt, ratio=ratio,
             )
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos and msg:
+            client.record_success()
             return JSONResponse({"created": int(time.time()), "data": [], "message": msg})
         if not videos:
             raise HTTPException(status_code=502, detail="No videos generated")
+        client.record_success()
 
         return JSONResponse({
             "created": int(time.time()),
@@ -1133,6 +1346,7 @@ def create_app(
         try:
             result = await client.upload_file(file_data, filename)
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
 
         return JSONResponse({
@@ -1149,11 +1363,14 @@ def create_app(
     @app.get("/v1/files/download")
     async def file_download(request: Request, uri: str, expire: int = 3600):
         _check_auth(request)
+        # Clamp caller-provided expiry to a sane range (DO NOT trust query input).
+        expire = max(60, min(int(expire), 7 * 24 * 3600))
         await bucket.acquire()
         client = _get_client()
         try:
             url = await client.get_file_download_url(uri=uri, expire_seconds=expire)
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
         return JSONResponse({"url": url, "uri": uri, "expires_in": expire})
 
@@ -1171,6 +1388,7 @@ def create_app(
         try:
             result = await client.upload_image(image_bytes=image_data, filename=filename)
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
         return JSONResponse({
             "uri": result["uri"],
@@ -1210,6 +1428,7 @@ def create_app(
                 use_deep_think=use_deep_think,
             )
         except RuntimeError as exc:
+            client.record_failure()
             raise HTTPException(status_code=502, detail=str(exc))
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -1246,7 +1465,7 @@ def create_app(
         images = [f for f in files if f.get("is_image")]
 
         if images:
-            from .client import DoubaoChatClient, EXTENSION_BOT_ID
+            from .client import EXTENSION_BOT_ID, DoubaoChatClient
             async with DoubaoChatClient(
                 cookies=await client.get_cookies_dict(),
                 ms_token=client._ms_token or "",
@@ -1397,6 +1616,7 @@ def create_app(
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         has_tools: bool = False,
+        valid_tool_names: Optional[set[str]] = None,
         messages_for_counting: Optional[list] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
@@ -1449,10 +1669,18 @@ def create_app(
                 bot_id=bot_id or None,
             ):
                 if event.get("error"):
-                    chunk = _make_chunk(
-                        {"content": f"[Error {event.get('status')}]"}
-                    )
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    status = event.get("status", 0)
+                    body_text = str(event.get("body", ""))[:300]
+                    log.error("Upstream stream error (status=%s): %s", status, body_text)
+                    client.record_failure()
+                    err = {
+                        "error": {
+                            "message": f"Upstream error (status={status}): {body_text}",
+                            "type": "upstream_error",
+                            "code": 502,
+                        }
+                    }
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -1468,11 +1696,16 @@ def create_app(
                 if event_type == "STREAM_ERROR" or event.get("error_code"):
                     code = event.get("error_code", 0)
                     msg = event.get("error_msg", "unknown error")
+                    log.error("Upstream error event: code=%s msg=%s", code, msg)
                     client.record_failure(code)
-                    chunk = _make_chunk(
-                        {"content": f"[Error code={code}: {msg}]"}
-                    )
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    err = {
+                        "error": {
+                            "message": f"Upstream error code={code}: {msg}",
+                            "type": "upstream_error",
+                            "code": 502,
+                        }
+                    }
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -1493,7 +1726,7 @@ def create_app(
                             # Check if we have complete tool calls
                             if has_complete_tool_calls(tool_buffer):
                                 # Parse and emit as tool_calls
-                                parsed = parse_tool_calls_xml(tool_buffer)
+                                parsed = parse_tool_calls_xml(tool_buffer, valid_tool_names=valid_tool_names)
                                 if parsed:
                                     # Emit tool_calls in OpenAI streaming format
                                     for idx, tc in enumerate(parsed):
@@ -1614,7 +1847,7 @@ def create_app(
                                     tool_mode = True
                                 if tool_mode:
                                     if has_complete_tool_calls(tool_buffer):
-                                        parsed = parse_tool_calls_xml(tool_buffer)
+                                        parsed = parse_tool_calls_xml(tool_buffer, valid_tool_names=valid_tool_names)
                                         if parsed:
                                             for idx, tc in enumerate(parsed):
                                                 delta_tc = {
@@ -1677,13 +1910,22 @@ def create_app(
 
         except Exception as exc:
             log.error("Stream error: %s", exc)
-            chunk = _make_chunk({"content": f"[Error: {exc}]"})
-            yield f"data: {json.dumps(chunk)}\n\n"
+            client.record_failure()
+            err = {
+                "error": {
+                    "message": f"Stream error: {exc}",
+                    "type": "upstream_error",
+                    "code": 502,
+                }
+            }
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
         # Flush any remaining tool buffer
         if tool_buffer:
             if tool_mode and has_complete_tool_calls(tool_buffer):
-                parsed = parse_tool_calls_xml(tool_buffer)
+                parsed = parse_tool_calls_xml(tool_buffer, valid_tool_names=valid_tool_names)
                 if parsed:
                     for idx, tc in enumerate(parsed):
                         delta_tc = {
@@ -1777,6 +2019,9 @@ def create_app(
             "rpm_limit": rpm_limit,
             "host": os.environ.get("DOUBAO_HOST", "0.0.0.0"),
             "port": int(os.environ.get("DOUBAO_PORT", "9090")),
+            "admin_debug": ADMIN_DEBUG,
+            "cors_enabled": bool(CORS_ORIGINS),
+            "auth_enabled": bool(api_key),
             "models": {
                 "chat": list(CHAT_MODELS.keys()),
                 "image": ["doubao-image"],
@@ -1793,20 +2038,31 @@ def create_app(
 
     @app.get("/admin/api/cookies")
     async def admin_cookies(request: Request):
-        """Return current browser cookies."""
+        """Return current browser cookies (values masked unless admin debug is on)."""
         _check_auth(request)
         client = _browser.get("client")
         if client is None or client._context is None:
-            return JSONResponse({"cookies": [], "total": 0})
+            return JSONResponse({"cookies": [], "total": 0, "masked_values": not ADMIN_DEBUG})
         try:
             cookies = await client._context.cookies("https://www.doubao.com")
-            cookies_list = [
-                {"name": c["name"], "value": c["value"], "length": len(c["value"])}
-                for c in cookies
-            ]
-            return JSONResponse({"cookies": cookies_list, "total": len(cookies_list)})
+            cookies_list = []
+            for c in cookies:
+                value = c["value"]
+                entry = {
+                    "name": c["name"],
+                    "length": len(value),
+                    "value_masked": (value[:4] + "***" + value[-4:]) if len(value) > 8 else "***",
+                }
+                if ADMIN_DEBUG:
+                    entry["value"] = value
+                cookies_list.append(entry)
+            return JSONResponse({
+                "cookies": cookies_list,
+                "total": len(cookies_list),
+                "masked_values": not ADMIN_DEBUG,
+            })
         except Exception:
-            return JSONResponse({"cookies": [], "total": 0})
+            return JSONResponse({"cookies": [], "total": 0, "masked_values": not ADMIN_DEBUG})
 
     @app.post("/admin/api/probe")
     async def admin_probe(request: Request):
@@ -1815,6 +2071,7 @@ def create_app(
         client = _browser.get("client")
         if client is None or not client.is_ready:
             return JSONResponse({"status": "error", "message": "未登录"})
+        await bucket.acquire()
         try:
             t0 = time.time()
             result = await client.chat("1+1=?只回答数字", use_deep_think=0)
@@ -1839,15 +2096,32 @@ def create_app(
         return {"status": "login_started", "message": "QR code displayed in browser. Scan to login."}
     @app.post("/auth/reset_captcha")
     async def reset_captcha(request: Request):
-        """Reset captcha flag after manual verification via VNC."""
+        """Reset captcha flag after manual verification via VNC/noVNC."""
         _check_auth(request)
         client = _browser.get("client")
         if client is None:
             raise HTTPException(status_code=503, detail="Browser not initialized")
+        # Clears both the captcha flag and the consecutive-failure counter.
         client.record_success()
+        restarted = False
         if not client.is_ready:
-            client._ready = True
-        return {"status": "ok", "message": "Captcha flag cleared, service resumed."}
+            # Recover from the "too many failures" deadlock instead of blindly
+            # flipping the private ready flag.
+            try:
+                await client.restart()
+                restarted = True
+            except Exception as exc:
+                log.error("Restart after captcha reset failed: %s", exc)
+        if not client.is_ready:
+            raise HTTPException(
+                status_code=503,
+                detail="Browser is still not ready; please re-login via /admin.",
+            )
+        return {
+            "status": "ok",
+            "restarted": restarted,
+            "message": "Captcha flag cleared, service resumed.",
+        }
 
 
     async def _do_login(client: BrowserClient):
@@ -1899,6 +2173,11 @@ def create_app(
     async def auth_eval(request: Request):
         """Evaluate JS on the browser page (debug only)."""
         _check_auth(request)
+        if not ADMIN_DEBUG:
+            raise HTTPException(
+                status_code=403,
+                detail="JS evaluation is a debug endpoint. Set DOUBAO_ENABLE_ADMIN_DEBUG=true to enable.",
+            )
         client = _browser.get("client")
         if client is None or client.page is None:
             raise HTTPException(status_code=503, detail="Browser not available")
@@ -1943,7 +2222,7 @@ def create_app(
         _qr_login_state["status"] = "starting"
         _qr_login_state["error"] = ""
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def on_status(status: QRStatus, msg: str):
             _qr_login_state["status"] = status.value
@@ -1954,6 +2233,7 @@ def create_app(
             if result.status == QRStatus.CONFIRMED:
                 _qr_login_state["status"] = "success"
                 _qr_login_state["cookies"] = result.cookies
+                _qr_login_state["browser_ready"] = False
                 # Inject cookies into Playwright browser
                 client = _browser.get("client")
                 if client:
@@ -1999,6 +2279,7 @@ def create_app(
         if status == "success":
             resp["message"] = "登录成功，session 已更新"
             resp["cookies_count"] = len(_qr_login_state.get("cookies", {}))
+            resp["browser_ready"] = _qr_login_state.get("browser_ready")
         elif status == "failed":
             resp["error"] = _qr_login_state.get("error", "未知错误")
         elif status == "idle":
@@ -2040,13 +2321,24 @@ def run_server():
 
     app = create_app(api_key=api_key or None, rpm_limit=rpm)
 
-    print(f"\n  Doubao API Server (Playwright)")
+    print("\n  Doubao API Server (Playwright)")
     print(f"  Listening on http://{host}:{port}")
     print(f"  Admin page: http://{host}:{port}/admin")
     if novnc_url:
         print(f"  noVNC: {novnc_url}")
-    if api_key:
-        print(f"  API Key: {api_key[:4]}{'*' * (len(api_key) - 4)}")
+    loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not api_key:
+        if loopback:
+            print("  API key: not set (local-only bind, auth disabled)")
+        else:
+            print("  ⚠ API key: NOT SET while binding a public interface — every")
+            print("    endpoint is publicly accessible. Set DOUBAO_API_KEY.")
+    elif api_key == "change-me":
+        print("  ⚠ API key is the placeholder 'change-me' — change it before exposure.")
+    else:
+        print("  API key: configured (use DOUBAO_API_KEY to authenticate)")
+    if ADMIN_DEBUG:
+        print("  ⚠ Admin debug endpoints are ENABLED (DOUBAO_ENABLE_ADMIN_DEBUG=true)")
     print()
 
     uvicorn.run(app, host=host, port=port, log_level="info")

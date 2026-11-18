@@ -4,9 +4,10 @@
 # 注意: 如果服务已在运行（端口被占用），会直接提示而不是重复启动。
 cd "$(dirname "$0")"
 
+# 登录态目录：优先用外部传入的 DOUBAO_BROWSER_DATA，否则默认 ~/.doubao_browser
+export DOUBAO_BROWSER_DATA="${DOUBAO_BROWSER_DATA:-$HOME/.doubao_browser}"
 export DOUBAO_HEADLESS=false
-export DOUBAO_BROWSER_DATA="C:/Users/29084/Desktop/code/zcodeWorkspace/doubao-proxy/profile"
-export DOUBAO_PORT=9090
+export DOUBAO_PORT="${DOUBAO_PORT:-9090}"
 
 PORT="${DOUBAO_PORT:-9090}"
 

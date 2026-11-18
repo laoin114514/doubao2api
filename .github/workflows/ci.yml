@@ -2,25 +2,59 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
+    name: Lint (ruff)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Install ruff
-        run: pip install ruff
+        run: pip install -r requirements-dev.txt
 
-      - name: Lint
-        run: ruff check doubao2api/
+      # Use `ruff check` only (never `ruff format --check`) to match the
+      # project's configured lint rules (E, F, W, I with E501 ignored).
+      - name: Ruff check
+        run: ruff check doubao2api/ tests/
 
-      - name: Format check
-        run: ruff format --check doubao2api/
+  test:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # Offline only: unit tests never launch a browser, log in, or hit the
+      # network. The live scripts in tests/ are excluded via `__test__ = False`.
+      - name: Run unit tests
+        run: python -m pytest tests/ -q

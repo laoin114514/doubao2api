@@ -1333,6 +1333,10 @@ class DoubaoChatClient:
         """
         if not conversation_id or conversation_id == "0":
             return False
+        if self._session is None:
+            raise DoubaoChatError(
+                "Client session is not initialized; use 'async with DoubaoChatClient(...)'"
+            )
 
         url = f"{self.BASE_URL}/samantha/thread/delete"
         payload = {"thread_id": str(conversation_id)}
@@ -1506,13 +1510,13 @@ class DoubaoChatClient:
                 if not isinstance(item, dict):
                     continue
                 ori = item.get("image_ori", {}) or {}
-                raw = item.get("image_raw", {}) or {}
+                image_raw = item.get("image_raw", {}) or {}
                 thumb = item.get("image_thumb", {}) or {}
                 img = GeneratedImage(
                     key=item.get("key", ""),
                     thumb_url=thumb.get("url", ""),
                     ori_url=ori.get("url", ""),
-                    raw_url=raw.get("url", ""),
+                    raw_url=image_raw.get("url", ""),
                     width=ori.get("width", 0) or thumb.get("width", 0),
                     height=ori.get("height", 0) or thumb.get("height", 0),
                     format=ori.get("format", "") or thumb.get("format", ""),
@@ -1791,7 +1795,7 @@ class DoubaoChatClient:
                                         main_b64
                                     ).decode("utf-8", errors="replace")
                                     break
-                        except (json.JSONDecodeError, Exception):
+                        except Exception:
                             pass
 
                 cover_url = (
@@ -2014,7 +2018,7 @@ class DoubaoChatClient:
                                 main_url_b64
                             ).decode("utf-8", errors="replace")
                             break
-                except (json.JSONDecodeError, Exception):
+                except Exception:
                     pass
 
             # Extract cover URL

@@ -6,7 +6,6 @@ Applies a 1.3x safety factor since Doubao uses a different tokenizer
 (likely overestimates by 10-30%, which is safer for context management).
 """
 import logging
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +22,11 @@ def _get_encoder():
             _encoder = tiktoken.get_encoding("cl100k_base")
         except ImportError:
             log.warning("tiktoken not installed, using char-based estimation")
+            _encoder = "fallback"
+        except Exception as exc:
+            # tiktoken may fail to download its vocab file at runtime; never let
+            # token counting take down a request because of that.
+            log.warning("tiktoken initialisation failed (%s), using char-based estimation", exc)
             _encoder = "fallback"
     return _encoder
 

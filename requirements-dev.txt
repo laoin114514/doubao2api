@@ -1,0 +1,6 @@
+# Development and CI test dependencies.
+#
+# Install together with the runtime requirements:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8
+ruff>=0.5

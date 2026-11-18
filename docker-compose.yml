@@ -26,10 +26,27 @@ services:
     volumes:
       # 登录态持久化（重要：容器重建后不丢失）
       - ./profile:/app/profile
+      # 千问上游登录态（仅 QIANWEN_ENABLED=true 时使用）
+      - ./qianwen_profile:/app/qianwen_profile
     environment:
       DOUBAO_HOST: "0.0.0.0"
       DOUBAO_PORT: "${DOUBAO_PORT:-9090}"
       DOUBAO_HEADLESS: "false"
       DOUBAO_BROWSER_DATA: "/app/profile"
-      # ↓↓↓ 从 .env 读取（未设时用默认 change-me），生成密钥: openssl rand -hex 32
-      DOUBAO_API_KEY: "${DOUBAO_API_KEY:-change-me}"
+      DOUBAO_RPM_LIMIT: "${DOUBAO_RPM_LIMIT:-20}"
+      # ↓↓↓ 必填：务必在 .env 中设置随机密钥，生成方式: openssl rand -hex 32
+      # 未设置时 compose 会直接报错退出（避免以无鉴权方式暴露到公网）
+      DOUBAO_API_KEY: "${DOUBAO_API_KEY:?please set DOUBAO_API_KEY in .env (openssl rand -hex 32)}"
+      # noVNC（可选）：容器本身不跑 noVNC，需在宿主机另起 x11vnc/noVNC 时再填
+      DOUBAO_NOVNC_URL: "${DOUBAO_NOVNC_URL:-}"
+      DOUBAO_NOVNC_PASSWORD: "${DOUBAO_NOVNC_PASSWORD:-}"
+      # 安全相关（默认收紧）
+      DOUBAO_CORS_ORIGINS: "${DOUBAO_CORS_ORIGINS:-}"
+      DOUBAO_ENABLE_ADMIN_DEBUG: "${DOUBAO_ENABLE_ADMIN_DEBUG:-false}"
+      DOUBAO_ALLOW_PRIVATE_FILE_URLS: "${DOUBAO_ALLOW_PRIVATE_FILE_URLS:-false}"
+      DOUBAO_FILE_URL_MAX_MB: "${DOUBAO_FILE_URL_MAX_MB:-50}"
+      # 千问上游（可选）
+      QIANWEN_ENABLED: "${QIANWEN_ENABLED:-false}"
+      QIANWEN_HEADLESS: "${QIANWEN_HEADLESS:-true}"
+      QIANWEN_BROWSER_DATA: "${QIANWEN_BROWSER_DATA:-/app/qianwen_profile}"
+      QIANWEN_OBFUSCATE_TOOLS: "${QIANWEN_OBFUSCATE_TOOLS:-false}"

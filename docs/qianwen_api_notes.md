@@ -320,11 +320,12 @@ QIANWEN_HEADLESS=true
 QIANWEN_BROWSER_DATA=/opt/doubao2api/.qianwen_browser
 ```
 
-## 部署状态（2026-05-24）
+## 部署形态示例（2026-05-24）
 
-**已上线运行**，与豆包共用同一端点：
-- 端点: `http://103.237.92.203:9090/v1`
-- Key: `sk-doubao-6c109ee905c2c5150fa43a62acc0e056`
+与豆包共用同一端点，按 model 字段路由：
+
+- 端点: `http://<your-server>:9090/v1`
+- Key: `<YOUR_API_KEY>`（请使用自己通过 `openssl rand -hex 32` 生成的密钥，不要提交到仓库）
 - 通过 model 字段路由：`qianwen-*` → 千问，`doubao-*` → 豆包
 
 ### OpenAI兼容模型名映射

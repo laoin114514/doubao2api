@@ -2,15 +2,17 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Docker](https://img.shields.io/badge/docker-supported-blue?logo=docker)](https://github.com/wangchuxiaoji-oss/doubao2api#docker-%E9%83%A8%E7%BD%B2%E5%8F%AF%E9%80%89)
-[![GitHub Stars](https://img.shields.io/github/stars/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/issues)
-[![GitHub Last Commit](https://img.shields.io/github/last-commit/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/commits/main)
+[![Docker](https://img.shields.io/badge/docker-supported-blue?logo=docker)](https://github.com/laoin114514/doubao2api#docker-%E9%83%A8%E7%BD%B2%E5%8F%AF%E9%80%89)
+[![GitHub Stars](https://img.shields.io/github/stars/laoin114514/doubao2api?style=social)](https://github.com/laoin114514/doubao2api/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/laoin114514/doubao2api?style=social)](https://github.com/laoin114514/doubao2api/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/laoin114514/doubao2api)](https://github.com/laoin114514/doubao2api/issues)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/laoin114514/doubao2api)](https://github.com/laoin114514/doubao2api/commits/master)
 
 逆向豆包（Doubao）客户端 API，为 AI 智能体提供免费的多模态能力。通过 OpenAI 兼容接口，让任何纯文本模型也能识图、读文件、生成图片/音乐/视频。
 
 起初只是想给自己的 Hermes Agent（基于 DeepSeek V4 Flash）补上识图能力，结果越写越多，索性做成了完整的逆向客户端和 API 服务。
+
+> **关于本仓库**：本仓库是上游 doubao2api 项目的 fork，保留上游全部署名与 Apache-2.0 许可（见 `LICENSE`、`pyproject.toml`）。在继承上游多模态能力的基础上，本仓库侧重工程化与安全加固：Linux Docker 部署修复（xvfb 有头指纹、国内镜像源）、安全与稳定性修复（管理调试端点默认关闭、远程文件 URL 的 SSRF 防护、CORS 默认关闭）、以及 pytest 单元测试与 GitHub Actions CI。仓库地址：[github.com/laoin114514/doubao2api](https://github.com/laoin114514/doubao2api)。
 
 ## 目录
 
@@ -39,6 +41,8 @@
     - [GET /health](#get-health)
     - [GET /v1/models](#get-v1models)
     - [POST /v1/chat/completions](#post-v1chatcompletions)
+    - [工具调用（实验性，服务端模拟）](#工具调用实验性服务端模拟)
+    - [POST /v1/chat/completions/with-file](#post-v1chatcompletionswith-file)
     - [POST /v1/files](#post-v1files)
     - [GET /v1/files/download](#get-v1filesdownload)
     - [POST /v1/images/upload](#post-v1imagesupload)
@@ -79,7 +83,7 @@
 - **多媒体生成**：免费生成图片（文生图、图生图）、音乐、视频，Agent 的输出不再局限于文字
 - **文件中转站**（奇淫技巧）：通过 `/v1/files` 可上传任意文件（最大 1GB）获得一个永久 TOS URI，之后随时凭这个 URI 调用 `/v1/files/download` 换取 7 天有效的下载链接，过期了再换一个就行。这意味着你可以把它当作**免费的跨机器文件传输通道**——Agent A 在服务器 A 上传文件拿到 URI，把 URI 传给 Agent B，Agent B 在另一台服务器上凭 URI 获取下载链接直接拉取文件。无需自建 OSS，无需打通内网，单文件最大 1GB，存储不过期。有兴趣的兄弟可以基于这个开做个文件中转，感觉会很不错
 
-⚠️ **不适合编程智能体**：豆包客户端模型**不支持 Function Calling / Tool Use**（无法调用外部工具如文件读写、终端命令、代码搜索等），因此**不适合**作为编程智能体（Claude Code、Codex、OpenCode 等）的后端模型。如果你需要的是能操作代码仓库的 coding agent，请选择原生支持工具调用的模型 API。
+⚠️ **编程智能体适配性**：豆包客户端模型**没有原生 Function Calling / Tool Use**。本服务通过 `tool_calling.py` 提供**实验性 XML 模拟工具调用**：把工具定义注入系统提示词，再从模型回复中解析 `<tool_call>` 标签转成 OpenAI 的 `tool_calls` 结构（可选按工具名白名单过滤，降低幻觉调用）。这能应付简单工具场景，但可靠性与原生支持工具调用的模型（如 DeepSeek、Claude、GPT）仍有明显差距，**因此仍不建议**把本服务作为 Claude Code、Codex、OpenCode 等编程智能体的主力后端。
 
 ## 原理
 
@@ -99,10 +103,10 @@
 
 ```bash
 # 方式一：pip 安装（推荐）
-pip install git+https://github.com/wangchuxiaoji-oss/doubao2api.git
+pip install git+https://github.com/laoin114514/doubao2api.git
 
 # 方式二：从源码
-git clone https://github.com/wangchuxiaoji-oss/doubao2api.git
+git clone https://github.com/laoin114514/doubao2api.git
 cd doubao2api
 pip install -e .
 ```
@@ -110,8 +114,15 @@ pip install -e .
 ### Docker 部署（可选）
 
 ```bash
-docker build -t doubao2api .
-docker run -d -p 9090:9090 -v ./. doubao_session.json:/app/.doubao_session.json doubao2api
+# 方式一：docker compose（推荐；Linux 无头服务器见 DEPLOY_LINUX.md）
+cp .env.example .env
+# 必填：在 .env 中设置 DOUBAO_API_KEY（openssl rand -hex 32），未设置 compose 会直接报错
+docker compose up -d --build
+
+# 方式二：直接构建 Linux 镜像（内置 xvfb，有头运行避免风控；登录态存 ./profile）
+docker build -f Dockerfile.linux -t doubao2api .
+docker run -d -p 9090:9090 -v ./profile:/app/profile \
+  -e DOUBAO_API_KEY=your-secret-key doubao2api
 ```
 
 ### 前置条件
@@ -949,7 +960,11 @@ Run up fly up
 #### 安装依赖
 
 ```bash
-pip install aiohttp fastapi pydantic uvicorn httpx playwright playwright-stealth python-multipart
+# 统一依赖清单（含 httpx / playwright / playwright-stealth / python-multipart）
+pip install -r requirements.txt
+# 或安装发行版（含 CLI 入口）
+pip install -e .
+# 首次使用需下载 Chromium（约 150MB）
 playwright install chromium
 ```
 
@@ -1023,14 +1038,25 @@ server {
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `DOUBAO_HOST` | `0.0.0.0` | 监听地址（Docker/生产用 `0.0.0.0`，仅本机可 `127.0.0.1`） |
 | `DOUBAO_PORT` | `9090` | 监听端口 |
-| `DOUBAO_HOST` | `0.0.0.0` | 监听地址 |
 | `DOUBAO_API_KEY` | (空=无认证) | Bearer token。设为 `any` 接受任意非空 key |
-| `DOUBAO_RPM_LIMIT` | `20` | 每分钟请求限制（所有端点共享） |
-| `DOUBAO_HEADLESS` | `true` | Chromium 是否无头运行 |
-| `DOUBAO_BROWSER_DATA` | `~/.doubao_browser` | Chromium 持久化用户目录 |
+| `DOUBAO_RPM_LIMIT` | `20` | 每分钟请求限制（所有端点共享）；`0` 禁用限流 |
+| `DOUBAO_HEADLESS` | `true` | Chromium 是否无头运行（Linux Docker 用 xvfb 保持有头指纹） |
+| `DOUBAO_BROWSER_DATA` | `~/.doubao_browser` | Chromium 持久化用户目录（登录态所在） |
+| `DOUBAO_COOKIE` | 空 | 直接注入 Cookie 头（`sessionid=...; ttwid=...`），优先于 session 文件 |
 | `DOUBAO_NOVNC_URL` | 自动推断 | Admin 面板中的 noVNC 地址 |
 | `DOUBAO_NOVNC_PASSWORD` | 空 | 自动拼接到 noVNC URL 的密码参数 |
+| `DOUBAO_CORS_ORIGINS` | 空 | 允许跨域的 Origin 列表（逗号分隔）；默认空 = 不发送 CORS 响应头 |
+| `DOUBAO_ENABLE_ADMIN_DEBUG` | `false` | 管理调试开关：开启后才允许 `POST /auth/eval` 与 `/admin/api/cookies` 导出明文 Cookie |
+| `DOUBAO_ALLOW_PRIVATE_FILE_URLS` | `false` | 允许远程 `file_url` 下载内网/私有地址（默认关闭，防 SSRF） |
+| `DOUBAO_FILE_URL_MAX_MB` | `50` | 远程 `file_url` 下载大小上限（MB） |
+| `QIANWEN_ENABLED` | `false` | 启用千问（Qianwen）上游，提供 `qianwen-*` 模型 |
+| `QIANWEN_HEADLESS` | `true` | 千问浏览器是否无头运行 |
+| `QIANWEN_BROWSER_DATA` | `~/.qianwen_browser` | 千问浏览器持久化用户目录 |
+| `QIANWEN_OBFUSCATE_TOOLS` | `false` | 千问工具调用时混淆工具名（规避上游对工具名的拦截） |
+
+完整配置模板见仓库根目录 [`.env.example`](.env.example)（复制为 `.env` 后按需修改）。
 
 ### 认证
 
@@ -1099,6 +1125,8 @@ curl http://localhost:9090/v1/session/qr-login \
 | `doubao-video` | video | — | 视频生成 |
 | `doubao-music` | audio | — | 音乐生成 |
 
+设置 `QIANWEN_ENABLED=true` 后，同一服务还会按 `model` 字段额外路由千问（Qianwen）模型：`qianwen`、`qianwen-max`、`qianwen-max-think`、`qianwen-think`、`qianwen-coder`、`qianwen-flash`、`qianwen-search`，以及 `Qwen3.7-Max` / `Qwen3-Coder` 等原生 modelCode。
+
 ### 端点详细规范
 
 #### GET /health
@@ -1147,17 +1175,18 @@ OpenAI 兼容的聊天补全端点。
 }
 ```
 
-**文件输入**：当前统一服务支持 OpenAI 风格的 `file_url`，仅支持非流式请求。图片输入的 `image_url` 结构暂未在统一服务中解析。
+**文件输入**：统一服务支持 OpenAI 风格的 `file_url` / `image_url`（`tos-*` URI、`data:` base64、或公网 `http(s)` URL）。远程 URL 默认禁止指向内网/回环地址（防 SSRF，可用 `DOUBAO_ALLOW_PRIVATE_FILE_URLS` 放开），单文件上限由 `DOUBAO_FILE_URL_MAX_MB` 控制（默认 50MB）。带附件的流式请求会在服务端收齐全文后以单次 SSE 增量返回。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `model` | string | 否 | 模型 ID，默认 `doubao` |
-| `messages` | array | 是 | 消息数组，支持 `system`/`user`/`assistant` 角色 |
+| `messages` | array | 是 | 消息数组，支持 `system`/`user`/`assistant`/`tool` 角色 |
 | `stream` | bool | 否 | 是否流式返回，默认 `false` |
 | `conversation_id` | string | 否 | 多轮对话 ID。首次不传，响应中返回新 ID，后续请求带上即可续接上下文 |
 | `bot_id` | string | 否 | 切换 Bot，默认 `7338286299411103781` |
-| `temperature` | float | 否 | 温度参数（保留字段，当前不影响行为） |
-| `max_tokens` | int | 否 | 最大 token 数（保留字段） |
+| `temperature` | float | 否 | 保留字段（上游 Web 接口不支持，当前不生效） |
+| `max_tokens` | int | 否 | 非流式响应按约 2.5 字符/token 截断；流式忽略 |
+| `tools` / `tool_choice` | array / any | 否 | 实验性模拟工具调用，见下方「工具调用」说明 |
 
 **非流式响应**：
 ```json
@@ -1214,10 +1243,80 @@ data: [DONE]
 **错误码**：
 | HTTP 状态 | 说明 |
 |-----------|------|
-| 400 | 无效模型或空消息 |
+| 400 | 无效模型、空消息、附件与 tools 同时使用、file_url 指向内网 |
 | 401 | 认证失败 |
+| 413 | file_url 下载超过大小上限 |
 | 503 | 未登录、浏览器未初始化或需要验证码 |
 | 502 | 上游错误（豆包 API 异常） |
+
+> 注意：**流式响应一旦开始，HTTP 状态码已固定为 200**。若上游此后报错，服务端会发送一个错误对象后立即结束流：
+> ```
+> data: {"error":{"message":"Upstream error code=...","type":"upstream_error","code":502}}
+> data: [DONE]
+> ```
+> 客户端应同时检查 `choices[].delta` 与顶层 `error` 字段。非流式请求仍返回上表对应的 HTTP 状态码。
+
+#### 工具调用（实验性，服务端模拟）
+
+豆包 Web 模型没有原生 Function Calling，本服务用「提示词注入 + XML 解析」模拟 OpenAI tools 协议：
+
+1. 把 `tools` 压缩成提示词注入系统消息，要求模型输出 `<tool_call>{"name":...,"arguments":{...}}</tool_call>`；
+2. 从模型回复中解析（支持官方 `<tool_call>`、缺失开标签、裸 JSON、旧 `<invoke>` 共 4 级 fallback），并只保留 `tools` 中声明过的工具名（白名单过滤幻觉调用）；
+3. 转成标准 OpenAI `message.tool_calls`（流式为两段式增量：先 name 后 arguments）。
+
+```json
+{
+  "model": "doubao-expert",
+  "messages": [{"role": "user", "content": "北京现在天气怎么样？"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "查询城市天气",
+      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+    }
+  }]
+}
+```
+
+注意：
+- 带 `tools` 时会**强制使用专家模式**（专家额度不足时自动降级为思考模式），响应中的 `model` 仍原样回显请求值；
+- `tool_choice` 当前不生效；
+- 附件（`file_url`/`image_url`）不能与 `tools` 同时使用（返回 400）；
+- 模拟调用可靠性不如原生工具调用，适合轻量场景，不建议作为编程智能体主力后端。
+
+---
+
+#### POST /v1/chat/completions/with-file
+
+「文件 + 提问」一步到位的便捷端点：直接引用已上传文件的 TOS URI 发起带文件的非流式对话，等价于先调 `/v1/files` 再在 `/v1/chat/completions` 里用 `file_url` 引用。仅支持非流式。
+
+**请求体**（`application/json`）：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `file_id` | string | 是 | `/v1/files` 返回的 TOS URI（或文件引用） |
+| `prompt` | string | 是 | 针对文件的问题 |
+| `file_name` | string | 否 | 原始文件名，默认 `file.txt` |
+| `file_size` | int | 否 | 文件大小（字节） |
+| `model` | string | 否 | 模型 ID，默认 `doubao` |
+
+**curl 示例**：
+```bash
+curl http://localhost:9090/v1/chat/completions/with-file \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"file_id":"tos-cn-i-ik7evvg4ik/xxx.pdf","prompt":"总结这份文档","file_name":"report.pdf","model":"doubao"}'
+```
+
+**响应**：与 `POST /v1/chat/completions` 非流式响应结构一致（答案在 `choices[0].message.content`）。
+
+**错误码**：
+| HTTP 状态 | 说明 |
+|-----------|------|
+| 400 | 缺少 `file_id` 或 `prompt` |
+| 401 | 认证失败 |
+| 502 | 上游错误或文件读取失败 |
 
 ---
 
@@ -1689,7 +1788,11 @@ curl http://localhost:9090/v1/images/generations \
 
 #### GET /admin/api/cookies
 
-当前 session 的 Cookie 详情。
+当前 session 的 Cookie 详情。默认只返回 Cookie 的 `name`/`length` 等元信息；只有在 `DOUBAO_ENABLE_ADMIN_DEBUG=true` 时才返回明文 `value`。
+
+#### POST /auth/eval
+
+在浏览器页面上执行任意 JavaScript（调试用）。**仅当 `DOUBAO_ENABLE_ADMIN_DEBUG=true` 时可用**，否则返回 404/403；生产环境请保持关闭。
 
 ### 使用 OpenAI Python SDK
 
@@ -2041,23 +2144,32 @@ Admin 面板会合并多次增量搜索结果，并显示关键词、来源和�
 
 ```
 doubao2api/
-├── __init__.py          # 公开 API
-├── __main__.py          # CLI 入口
-├── browser_client.py    # BrowserClient（浏览器内 fetch + expose_function 流式桥接）
-├── client.py            # DoubaoChatClient（旧版独立客户端，保留兼容）
-├── unified_server.py    # 统一 API 服务（FastAPI，OpenAI 兼容）
-├── session.py           # Cookie 加载（JSON 文件）
-├── sse.py               # Server-Sent Events 解析器
-├── qr_login.py          # QR 扫码登录（纯 HTTP）
-├── captcha_handler.py   # 验证码处理
-├── captcha_server.py    # 验证码本地 Web 服务
-└── static/
-    └── admin.html       # Admin Dashboard（Vue 3）
+├── doubao2api/              # Python 包
+│   ├── __init__.py          # 公开 API
+│   ├── __main__.py          # CLI 入口
+│   ├── browser_client.py    # BrowserClient（浏览器内 fetch + expose_function 流式桥接）
+│   ├── client.py            # DoubaoChatClient（旧版独立客户端，保留兼容）
+│   ├── unified_server.py    # 统一 API 服务（FastAPI，OpenAI 兼容）
+│   ├── session.py           # Cookie 加载（JSON 文件 / DOUBAO_COOKIE）
+│   ├── sse.py               # Server-Sent Events 解析器
+│   ├── qr_login.py          # QR 扫码登录（纯 HTTP）
+│   ├── captcha_handler.py   # 验证码处理
+│   ├── captcha_server.py    # 验证码本地 Web 服务
+│   ├── token_counter.py     # token 计数（tiktoken，缺失时降级估算）
+│   ├── tool_calling.py      # 实验性 XML 模拟工具调用（提示词注入 + <tool_call> 解析）
+│   ├── qianwen_client.py    # 千问上游客户端（可选，浏览器内签名 + fetch）
+│   └── static/
+│       └── admin.html       # Admin Dashboard（Vue 3 单文件应用）
+├── docs/                    # 文档站（index.html、social-preview.svg）与 API 笔记
+├── tests/                   # pytest 单元测试 + 端到端/可靠性脚本
+├── Dockerfile / Dockerfile.linux / docker-compose.yml   # 容器部署
+├── DEPLOY_LINUX.md          # Linux（Docker）部署指南
+└── README.md                # 本文档
 ```
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=wangchuxiaoji-oss/doubao2api&type=Date)](https://star-history.com/#wangchuxiaoji-oss/doubao2api&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=laoin114514/doubao2api&type=Date)](https://star-history.com/#laoin114514/doubao2api&Date)
 
 ---
 

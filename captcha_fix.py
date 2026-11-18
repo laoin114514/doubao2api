@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-PROFILE = Path(r"C:\Users\29084\Desktop\code\zcodeWorkspace\doubao-proxy\profile")
+# 登录态目录：与服务共用，优先读 DOUBAO_BROWSER_DATA，否则默认 ~/.doubao_browser
+PROFILE = Path(os.environ.get("DOUBAO_BROWSER_DATA", "~/.doubao_browser")).expanduser()
 CHAT_URL = "https://www.doubao.com/chat/"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")

@@ -1,7 +1,10 @@
 # Sensitive session data
 .doubao_session.json
+*.corrupt
 decrypted_cookies.json
 .env
+profile/
+qianwen_profile/
 
 # Python
 __pycache__/
@@ -12,6 +15,8 @@ dist/
 build/
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
 
 # IDE / Editor
 .cursor/

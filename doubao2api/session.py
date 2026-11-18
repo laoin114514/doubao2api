@@ -6,9 +6,12 @@ Supports loading cookies from:
 2. .doubao_session.json file (written by QR login or /v1/session/update)
 """
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict
+
+log = logging.getLogger(__name__)
 
 
 def _parse_cookie_header(cookie_header: str) -> Dict[str, str]:
@@ -90,7 +93,15 @@ def save_params(
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            # Never silently wipe cookies: keep the corrupt file as a backup so
+            # the user can recover the login session from it.
+            backup = path.with_suffix(path.suffix + ".corrupt")
+            try:
+                path.replace(backup)
+                log.warning("Corrupt session file moved to %s", backup)
+            except OSError as exc:
+                log.warning("Corrupt session file could not be backed up: %s", exc)
+            data = {}
     data["params"] = {
         "device_id": params.get("device_id", ""),
         "web_id": params.get("web_id", ""),

@@ -17,11 +17,11 @@ import json
 import logging
 import time
 import uuid
-from typing import AsyncGenerator, Optional, Dict, Any, List
+from typing import Any, AsyncGenerator, Dict, List, Optional
 from urllib.parse import urlencode
 
 import httpx
-from playwright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
 log = logging.getLogger(__name__)
@@ -149,6 +149,13 @@ class BrowserClient:
 
     async def stop(self):
         """Close browser and httpx client."""
+        # Unblock any pending stream consumers so they don't sit on the 180s timeout.
+        for queue in list(self._stream_queues.values()):
+            try:
+                queue.put_nowait("__ERROR__:Browser stopped")
+            except Exception:
+                pass
+        self._stream_queues.clear()
         if self._http:
             await self._http.aclose()
             self._http = None
@@ -166,6 +173,9 @@ class BrowserClient:
         self._playwright = None
         self._page = None
         self._ready = False
+        # Must be reset so the next start() re-registers expose_function on the
+        # new page; otherwise every request after a watchdog restart times out.
+        self._bridge_ready = False
         log.info("BrowserClient stopped")
 
     async def is_alive(self) -> bool:
@@ -193,8 +203,12 @@ class BrowserClient:
     # Login
     # ------------------------------------------------------------------
 
-    async def _check_login_state(self):
-        """Check if logged in by looking for login button."""
+    async def _check_login_state(self) -> bool:
+        """Check login state and initialise the request-signing machinery.
+
+        Returns True only when the browser is logged in *and* the fetch bridge
+        is ready; a half-initialised client must never report ready.
+        """
         login_btn = self._page.locator('button:has-text("登录")')
         btn_count = await login_btn.count()
         log.info("Login check: login_button_count=%d", btn_count)
@@ -202,15 +216,24 @@ class BrowserClient:
         if btn_count > 0:
             log.info("Not logged in - login button visible")
             self._ready = False
-            return
+            return False
 
+        self._ready = False
+        try:
+            await self._extract_params()
+            await self._seed_ms_token()
+            await self._setup_fetch_bridge()
+            await self._verify_fetch_hook()
+            await self._wait_for_signing()  # still needed for upload endpoints
+        except Exception as exc:
+            log.error("Browser initialisation failed: %s", exc)
+            self._ready = False
+            raise
+        self._consecutive_failures = 0
+        self._last_error_code = 0
         self._ready = True
-        await self._extract_params()
-        await self._seed_ms_token()
-        await self._setup_fetch_bridge()
-        await self._verify_fetch_hook()
-        await self._wait_for_signing()  # still needed for upload endpoints
         log.info("Ready! device_id=%s, fetch_hook=%s", self._device_id, self._bridge_ready)
+        return True
 
     async def _extract_params(self):
         """Extract device_id, web_id, fp from localStorage/cookies."""
@@ -301,14 +324,10 @@ class BrowserClient:
             await login_btn.wait_for(state="hidden", timeout=timeout * 1000)
             await asyncio.sleep(2)
             if await login_btn.count() == 0:
-                self._ready = True
-                await self._extract_params()
-                await self._seed_ms_token()
-                await self._setup_fetch_bridge()
-                await self._verify_fetch_hook()
-                await self._wait_for_signing()
-                log.info("Login successful!")
-                return True
+                if await self._check_login_state():
+                    log.info("Login successful!")
+                    return True
+                return False
             return False
         except Exception as e:
             log.error("Login timeout: %s", e)
@@ -571,6 +590,23 @@ class BrowserClient:
             self._browser_fetch_stream(url, payload, request_id)
         )
 
+        def _on_fetch_task_done(task: "asyncio.Task") -> None:
+            """Surface early failures instead of letting consumers hit the timeout."""
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                return
+            log.error("Browser fetch task failed: %s", exc)
+            q = self._stream_queues.get(request_id)
+            if q is not None:
+                try:
+                    q.put_nowait(f"__ERROR__:browser fetch failed: {exc}")
+                except Exception:
+                    pass
+
+        eval_task.add_done_callback(_on_fetch_task_done)
+
         # Yield parsed SSE events from queue
         try:
             while True:
@@ -613,6 +649,11 @@ class BrowserClient:
         self, url: str, payload: Dict[str, Any], request_id: str
     ):
         """Execute fetch() inside browser page and stream SSE chunks via callback."""
+        if not self._bridge_ready:
+            raise RuntimeError(
+                "Fetch bridge is not registered (browser was restarted without "
+                "re-initialising); refusing to issue a request that would time out"
+            )
         js_code = """
         async ([url, payloadJson, requestId]) => {
             try {
@@ -1159,7 +1200,6 @@ class BrowserClient:
         Returns:
             Dict with 'videos' list, each having video_url/cover_url/duration.
         """
-        import base64
 
         content_data: Dict[str, Any] = {"text": prompt}
         if ratio:
@@ -1353,11 +1393,12 @@ class BrowserClient:
         Returns:
             Dict with uri, name, size, file_type.
         """
-        import zlib
         import hashlib
         import hmac as hmac_mod
+        import zlib
         from datetime import datetime, timezone
-        from urllib.parse import urlparse, parse_qs, quote as url_quote
+        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import quote as url_quote
 
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")

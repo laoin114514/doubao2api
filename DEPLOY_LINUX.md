@@ -26,15 +26,15 @@ docker compose version
 
 ## 2. 把项目放到服务器
 
-方式 A：直接拷（从你 Windows 机器上已有的 clone）
+方式 A：直接拷（在本地仓库的上级目录执行）
 ```bash
-# 在 Windows 机器上执行
-scp -r C:/Users/29084/Desktop/code/zcodeWorkspace/doubao2api user@服务器IP:/opt/
+# 把整个 doubao2api 目录拷到服务器 /opt/ 下
+scp -r doubao2api user@服务器IP:/opt/
 ```
 
 方式 B：服务器上重新 clone（需要 GitHub 访问）
 ```bash
-git clone --depth 1 https://github.com/wangchuxiaoji-oss/doubao2api.git
+git clone --depth 1 https://github.com/laoin114514/doubao2api.git
 cd doubao2api
 ```
 
@@ -43,10 +43,12 @@ cd doubao2api
 ```bash
 cd doubao2api
 
-# 3.1 生成 API 密钥并写入 compose
+# 3.1 生成 API 密钥并写入 .env（compose 从 .env 读取；未设置会直接报错退出）
 API_KEY=$(openssl rand -hex 32)
 echo "你的 API Key: $API_KEY"   # 记下来，agent 配置要用
-sed -i "s/DOUBAO_API_KEY: \".*\"/DOUBAO_API_KEY: \"$API_KEY\"/" docker-compose.yml
+cp -n .env.example .env 2>/dev/null || touch .env
+sed -i "s/^DOUBAO_API_KEY=.*/DOUBAO_API_KEY=$API_KEY/" .env
+# 端口等按需在 .env 中调整（DOUBAO_PORT 默认 9090）
 
 # 3.2 首次构建（含 chromium 下载，约 3~5 分钟，需外网）
 docker compose up -d --build
@@ -98,7 +100,7 @@ model    = doubao        # 可选 doubao-think / doubao-pro / doubao-expert
 ```
 
 - **OpenAI 兼容客户端**（Cline/Continue/Cherry Studio/NextChat 等）：直接填上面三项。
-- **ZCode / Claude Code**（走 Anthropic 协议）：需要一个转换桥接，见下文「ZCode 接入」。
+- **ZCode / Claude Code**（走 Anthropic 协议）：需要 Anthropic→OpenAI 的转换桥接（如 claude-code-router、LiteLLM），把上游指向本服务的 `base_url`。注意本服务的工具调用为实验性 XML 模拟实现，编程场景建议只用对话能力。
 
 ## 7. 日常维护
 

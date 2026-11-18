@@ -12,6 +12,9 @@ requires-python = ">=3.10"
 authors = [
     { name = "wangchuxiaoji-oss" },
 ]
+maintainers = [
+    { name = "laoin114514" },
+]
 keywords = ["doubao", "豆包", "openai", "api", "reverse-engineering"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -27,14 +30,24 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.9",
     "fastapi>=0.100",
+    "httpx>=0.25",
+    "playwright>=1.40",
+    "playwright-stealth>=1.0.3",
     "pydantic>=2.0",
+    "python-multipart>=0.0.9",
     "uvicorn>=0.20",
 ]
 
+[project.optional-dependencies]
+# Exact token counting (falls back to char-based estimation when missing)
+tokenizer = ["tiktoken>=0.5"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
 [project.urls]
-Homepage = "https://github.com/wangchuxiaoji-oss/doubao2api"
-Repository = "https://github.com/wangchuxiaoji-oss/doubao2api"
-Issues = "https://github.com/wangchuxiaoji-oss/doubao2api/issues"
+Homepage = "https://github.com/laoin114514/doubao2api"
+Repository = "https://github.com/laoin114514/doubao2api"
+Issues = "https://github.com/laoin114514/doubao2api/issues"
+Upstream = "https://github.com/wangchuxiaoji-oss/doubao2api"
 
 [project.scripts]
 doubao2api = "doubao2api.__main__:main"

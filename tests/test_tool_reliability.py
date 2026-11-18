@@ -1,17 +1,21 @@
 """
-Phase 2: 50-Round Tool Calling Reliability Test.
+Phase 2: Tool Calling Reliability Test (47 scenarios).
+
+Manual/live test - requires a running doubao2api server with a logged-in
+browser session. It is NOT part of the offline pytest suite and is never run
+in CI; run it directly as a script.
 
 Simulates OpenCode's behavior: full message history, 8 tools, English,
 progressive context growth, mixed scenarios.
 
 Task: "Fix a bug in a Python web app's authentication module"
 
-Scenarios per round:
-- Rounds 1-10: Exploration (glob, grep, read_file)
-- Rounds 11-15: Planning (todowrite)
-- Rounds 16-35: Implementation (edit_file, write_file, bash)
-- Rounds 36-45: Testing (bash, read_file)
-- Rounds 46-50: Cleanup & verification (bash, grep)
+Scenario phases (47 scenarios total):
+- Rounds 1-10: Exploration (glob, grep, read_file) - 10 scenarios
+- Rounds 11-15: Planning (todowrite) - 5 scenarios
+- Rounds 16-32: Implementation (edit_file, write_file, bash) - 17 scenarios
+- Rounds 33-42: Testing (bash, read_file) - 10 scenarios
+- Rounds 43-47: Cleanup & verification (bash, grep) - 5 scenarios
 
 Metrics tracked:
 - Success: correct XML tool call parsed
@@ -20,19 +24,34 @@ Metrics tracked:
 - Context size growth
 
 Usage:
-    python3 tests/test_tool_reliability.py --base-url http://127.0.0.1:9090
+    DOUBAO_BASE_URL=http://127.0.0.1:9090 DOUBAO_API_KEY=sk-... \
+        python3 tests/test_tool_reliability.py
+
+    python3 tests/test_tool_reliability.py \
+        --base-url http://127.0.0.1:9090 --api-key "$DOUBAO_API_KEY" --rounds 47
 """
 import argparse
 import json
+import os
 import time
-import re
-import httpx
-import sys
 from datetime import datetime
 from typing import Optional
 
-BASE_URL = "http://127.0.0.1:9090"
+import httpx
+
+BASE_URL = os.environ.get("DOUBAO_BASE_URL", "http://127.0.0.1:9090")
 DELAY_BETWEEN_ROUNDS = 8  # seconds between requests to avoid rate limit
+
+# This module is a manual live script, not a pytest test module. Pytest honours
+# this flag and leaves it alone (the functions below are not offline tests).
+__test__ = False
+
+
+def _auth_headers(api_key: str) -> dict:
+    """Build request headers, adding bearer auth when an API key is configured."""
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
 
 # ── Tool Definitions (English, matching OpenCode) ──
 TOOLS = [
@@ -143,7 +162,7 @@ tests/test_auth.py::test_middleware_invalid_token PASSED
 
 # ── Scenario definitions: what to ask and expected tool ──
 SCENARIOS = [
-    # Phase 1: Exploration (rounds 1-10)
+    # Phase 1: Exploration (rounds 1-10, 10 scenarios)
     {"user": "I need to fix a bug in the authentication module of this Python web app. The token expiry check is broken - users with expired tokens can still access protected endpoints. Let me start by looking at the project structure.", "expect_tool": "glob", "fake_result": FAKE_PROJECT_STRUCTURE},
     {"user": "Let me look at the auth middleware to understand how tokens are verified.", "expect_tool": "read_file", "fake_result": FAKE_AUTH_MIDDLEWARE},
     {"user": "I see the middleware imports from jwt_handler. Let me read that file too.", "expect_tool": "read_file", "fake_result": FAKE_JWT_HANDLER},
@@ -154,13 +173,13 @@ SCENARIOS = [
     {"user": "Let me also check the config to understand token expiry settings.", "expect_tool": "read_file", "fake_result": "# config.py\nTOKEN_EXPIRE_HOURS = 24\nREFRESH_TOKEN_DAYS = 7\nSECRET_KEY = 'your-secret-key'\nDATABASE_URL = 'postgresql://localhost/myapp'"},
     {"user": "Check if there's a requirements.txt to understand dependencies.", "expect_tool": "read_file", "fake_result": "fastapi==0.104.1\nuvicorn==0.24.0\npyjwt==2.8.0\npython-dotenv==1.0.0\nsqlalchemy==2.0.23\npytest==7.4.3"},
     {"user": "Let me look at how the routes use the middleware dependency.", "expect_tool": "read_file", "fake_result": "from fastapi import APIRouter, Depends\nfrom src.auth.middleware import verify_token\n\nrouter = APIRouter()\n\n@router.get('/users/me')\nasync def get_current_user(request: Request, _=Depends(verify_token)):\n    user_id = request.state.user_id\n    return {'user_id': user_id}"},
-    # Phase 2: Planning (rounds 11-15)
+    # Phase 2: Planning (rounds 11-15, 5 scenarios)
     {"user": "Now I have a clear picture. Let me plan the fix.", "expect_tool": "todowrite", "fake_result": "Task list updated."},
     {"user": "Before fixing, let me understand: is the `decode_token` function in jwt_handler.py already checking expiry via PyJWT? Because PyJWT's `jwt.decode` raises `ExpiredSignatureError` automatically.", "expect_tool": None, "fake_result": None},
     {"user": "Good point. So the bug is that middleware.py has a redundant (and broken) expiry check on line 18. The `decode_token` function already handles expiry via PyJWT. The fix should remove the broken manual check and rely on the TokenExpiredError that's already caught. Let me also check if there are edge cases.", "expect_tool": "grep", "fake_result": "src/auth/middleware.py:18:        if payload.get(\"exp\") < time.time:\nsrc/auth/oauth.py:45:        if token_data['exp'] < time.time():"},
     {"user": "Found another instance in oauth.py but that one correctly uses `time.time()` with parentheses. Now let me check the password module for completeness.", "expect_tool": "read_file", "fake_result": "\"\"\"Password hashing utilities.\"\"\"\nimport bcrypt\n\ndef hash_password(password: str) -> str:\n    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()\n\ndef verify_password(password: str, hashed: str) -> bool:\n    return bcrypt.checkpw(password.encode(), hashed.encode())"},
     {"user": "Good, password module is fine. Let me update my task list and start the fix.", "expect_tool": "todowrite", "fake_result": "Task list updated."},
-    # Phase 3: Implementation (rounds 16-35)
+    # Phase 3: Implementation (rounds 16-32, 17 scenarios)
     {"user": "Fix the bug in middleware.py: remove the broken manual expiry check since decode_token already handles it via PyJWT's ExpiredSignatureError.", "expect_tool": "edit_file", "fake_result": "File edited successfully."},
     {"user": "Now let me improve the error handling in the middleware to be more specific about different failure modes.", "expect_tool": "edit_file", "fake_result": "File edited successfully."},
     {"user": "Let me also add proper logging to the middleware for debugging auth failures.", "expect_tool": "edit_file", "fake_result": "File edited successfully."},
@@ -178,7 +197,7 @@ SCENARIOS = [
     {"user": "Update __init__.py to export the new refresh_token function.", "expect_tool": "edit_file", "fake_result": "File edited successfully."},
     {"user": "Run a quick format check with black.", "expect_tool": "bash", "fake_result": "reformatted src/auth/middleware.py\nreformatted src/auth/jwt_handler.py\nAll done! 2 files reformatted, 3 files left unchanged."},
     {"user": "Let me verify the final state of jwt_handler.py after all changes.", "expect_tool": "read_file", "fake_result": FAKE_JWT_HANDLER + "\ndef create_refresh_token(user_id: str) -> str:\n    expire = datetime.utcnow() + timedelta(days=7)\n    payload = {'sub': user_id, 'exp': expire.timestamp(), 'type': 'refresh'}\n    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)\n\ndef verify_refresh_token(token: str) -> str:\n    payload = decode_token(token)\n    if payload.get('type') != 'refresh':\n        raise ValueError('Not a refresh token')\n    return payload['sub']"},
-    # Phase 4: Testing (rounds 36-45)
+    # Phase 4: Testing (rounds 33-42, 10 scenarios)
     {"user": "Run all the auth tests now.", "expect_tool": "bash", "fake_result": FAKE_TEST_OUTPUT_PASS},
     {"user": "Run the full test suite to check for regressions.", "expect_tool": "bash", "fake_result": "tests/test_auth.py: 7 passed\ntests/test_api.py: 12 passed\ntests/test_refresh.py: 4 passed\n\n23 passed in 2.45s"},
     {"user": "Run tests with coverage to see if we missed anything.", "expect_tool": "bash", "fake_result": "Name                      Stmts   Miss  Cover\n-----------------------------------------------\nsrc/auth/__init__.py          4      0   100%\nsrc/auth/middleware.py       18      0   100%\nsrc/auth/jwt_handler.py      28      2    93%\nsrc/auth/password.py          6      0   100%\n-----------------------------------------------\nTOTAL                        56      2    96%"},
@@ -189,7 +208,7 @@ SCENARIOS = [
     {"user": "Check if there are any TODO comments we should address.", "expect_tool": "grep", "fake_result": "src/config.py:4:SECRET_KEY = 'your-secret-key'  # TODO: move to env var"},
     {"user": "Good catch. Let me fix that security issue - move SECRET_KEY to environment variable.", "expect_tool": "edit_file", "fake_result": "File edited successfully."},
     {"user": "Update the config to read from environment.", "expect_tool": "edit_file", "fake_result": "File edited successfully."},
-    # Phase 5: Cleanup & verification (rounds 46-50)
+    # Phase 5: Cleanup & verification (rounds 43-47, 5 scenarios)
     {"user": "Run the full test suite one final time to make sure everything passes.", "expect_tool": "bash", "fake_result": "23 passed in 2.31s"},
     {"user": "Let me do a final review - search for any remaining issues.", "expect_tool": "grep", "fake_result": "No matches found."},
     {"user": "Check git status to see all our changes.", "expect_tool": "bash", "fake_result": "modified:   src/auth/__init__.py\nmodified:   src/auth/middleware.py\nmodified:   src/auth/jwt_handler.py\nmodified:   src/config.py\nnew file:   tests/test_refresh.py\nmodified:   tests/test_auth.py"},
@@ -205,7 +224,6 @@ def classify_result(response: dict, expect_tool: Optional[str]) -> dict:
     message = choice["message"]
     content = message.get("content") or ""
     tool_calls = message.get("tool_calls")
-    finish_reason = choice.get("finish_reason", "")
 
     # Check for search hijack (search_results in non-streaming response isn't visible,
     # but if model answers directly when tool was expected, it's likely hijacked)
@@ -244,18 +262,23 @@ def classify_result(response: dict, expect_tool: Optional[str]) -> dict:
 
 
 # ── Main test runner ──
-def run_reliability_test(base_url: str, max_rounds: int = 50, delay: int = DELAY_BETWEEN_ROUNDS):
-    """Run the full 50-round reliability test."""
+def run_reliability_test(
+    base_url: str,
+    api_key: str = "",
+    max_rounds: int = len(SCENARIOS),
+    delay: int = DELAY_BETWEEN_ROUNDS,
+):
+    """Run the tool-calling reliability scenarios (all 47 by default)."""
     print(f"\n{'='*70}")
     print(f"  TOOL CALLING RELIABILITY TEST - {max_rounds} ROUNDS")
     print(f"  Target: {base_url}")
+    print(f"  Auth: {'bearer token configured' if api_key else 'no API key'}")
     print(f"  Delay: {delay}s between rounds")
     print(f"  Started: {datetime.now().isoformat()}")
     print(f"{'='*70}\n")
 
     messages = []  # Full conversation history
     results = []
-    tool_valid_names = {t["function"]["name"] for t in TOOLS}
 
     for i, scenario in enumerate(SCENARIOS[:max_rounds], 1):
         user_msg = scenario["user"]
@@ -274,12 +297,27 @@ def run_reliability_test(base_url: str, max_rounds: int = 50, delay: int = DELAY
         }
         payload_size = len(json.dumps(payload))
 
-        phase = "EXPLORE" if i <= 10 else "PLAN" if i <= 15 else "IMPL" if i <= 35 else "TEST" if i <= 45 else "CLEANUP"
+        phase = (
+            "EXPLORE"
+            if i <= 10
+            else "PLAN"
+            if i <= 15
+            else "IMPL"
+            if i <= 32
+            else "TEST"
+            if i <= 42
+            else "CLEANUP"
+        )
         print(f"[{i:02d}/{max_rounds}] {phase} | expect={expect_tool or 'text'} | ctx={payload_size:,} chars")
 
         start = time.time()
         try:
-            resp = httpx.post(f"{base_url}/v1/chat/completions", json=payload, timeout=120.0)
+            resp = httpx.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers=_auth_headers(api_key),
+                timeout=120.0,
+            )
             elapsed = time.time() - start
 
             if resp.status_code != 200:
@@ -359,7 +397,7 @@ def run_reliability_test(base_url: str, max_rounds: int = 50, delay: int = DELAY
 
     # Failure mode breakdown
     if fail > 0 or partial > 0:
-        print(f"\n  Failure modes:")
+        print("\n  Failure modes:")
         modes = {}
         for r in results:
             if r["status"] != "ok":
@@ -371,7 +409,7 @@ def run_reliability_test(base_url: str, max_rounds: int = 50, delay: int = DELAY
     # Latency stats
     latencies = [r["elapsed"] for r in results if "elapsed" in r]
     if latencies:
-        print(f"\n  Latency (seconds):")
+        print("\n  Latency (seconds):")
         print(f"    Min:  {min(latencies):.1f}")
         print(f"    Max:  {max(latencies):.1f}")
         print(f"    Avg:  {sum(latencies)/len(latencies):.1f}")
@@ -380,7 +418,7 @@ def run_reliability_test(base_url: str, max_rounds: int = 50, delay: int = DELAY
     # Context growth
     ctx_sizes = [r["ctx_size"] for r in results if "ctx_size" in r]
     if ctx_sizes:
-        print(f"\n  Context growth:")
+        print("\n  Context growth:")
         print(f"    Start: {ctx_sizes[0]:,} chars")
         print(f"    End:   {ctx_sizes[-1]:,} chars")
         print(f"    Growth: {(ctx_sizes[-1]-ctx_sizes[0]):,} chars over {len(ctx_sizes)} rounds")
@@ -403,9 +441,28 @@ def run_reliability_test(base_url: str, max_rounds: int = 50, delay: int = DELAY
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tool calling reliability test")
-    parser.add_argument("--base-url", default=BASE_URL)
-    parser.add_argument("--rounds", type=int, default=50)
+    parser.add_argument(
+        "--base-url",
+        default=BASE_URL,
+        help="doubao2api base URL (env: DOUBAO_BASE_URL)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("DOUBAO_API_KEY", ""),
+        help="Bearer token for the proxy (env: DOUBAO_API_KEY)",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=len(SCENARIOS),
+        help=f"number of scenarios to run (max {len(SCENARIOS)})",
+    )
     parser.add_argument("--delay", type=int, default=DELAY_BETWEEN_ROUNDS)
     args = parser.parse_args()
 
-    run_reliability_test(args.base_url, max_rounds=args.rounds, delay=args.delay)
+    run_reliability_test(
+        args.base_url,
+        args.api_key,
+        max_rounds=args.rounds,
+        delay=args.delay,
+    )

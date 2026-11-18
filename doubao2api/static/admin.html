@@ -76,7 +76,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
 <div class="flex items-center gap-2"><span :class="['w-2.5 h-2.5 rounded-full',session&&session.logged_in?'bg-green-400 pulse':'bg-red-400']"></span>
 <span class="text-lg font-semibold" :class="session&&session.logged_in?'text-green-400':'text-red-400'">{{session&&session.logged_in?'已登录':'未登录'}}</span></div></div>
 <div class="metric card"><div class="text-xs text-slate-400 mb-1">运行时长</div>
-<div class="text-lg font-semibold text-brand-400">{{fmtDur(session?session.age_seconds:0)}}</div></div>
+<div class="text-lg font-semibold text-brand-400">{{fmtDur(sysInfo?sysInfo.uptime_seconds:0)}}</div></div>
 <div class="metric card"><div class="text-xs text-slate-400 mb-1">RPM Limit</div>
 <div class="text-lg font-semibold text-white">{{sysInfo?sysInfo.rpm_limit:'--'}}</div></div>
 <div class="metric card"><div class="text-xs text-slate-400 mb-1">Cookies</div>
@@ -99,9 +99,6 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
 <div class="flex justify-between"><span class="text-slate-400">Platform</span><span class="text-slate-200 font-mono text-xs">{{sysInfo.platform}}</span></div>
 <div class="flex justify-between"><span class="text-slate-400">Python</span><span class="text-slate-200 font-mono text-xs">{{sysInfo.python_version?.split(' ')[0]}}</span></div>
 <div class="flex justify-between"><span class="text-slate-400">Listen</span><span class="text-slate-200 font-mono">{{sysInfo.host}}:{{sysInfo.port}}</span></div>
-<div class="flex justify-between"><span class="text-slate-400">Keepalive</span><span class="text-slate-200">{{fmtDur(sysInfo.keepalive_interval)}}</span></div>
-<div class="flex justify-between"><span class="text-slate-400">Auth Mode</span><span class="text-slate-200">{{sysInfo.api_key_mode}}</span></div>
-<div class="flex justify-between"><span class="text-slate-400">Session File</span><span class="text-slate-200 font-mono text-xs">{{sysInfo.session_file}}</span></div>
 </div>
 <h3 class="text-sm font-medium text-slate-300 mt-4 mb-2">可用模型</h3>
 <div class="flex flex-wrap gap-2">
@@ -110,7 +107,8 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 </div></div>
 <!-- Cookie table -->
 <div class="card">
-<h3 class="text-sm font-medium text-slate-300 mb-3">Cookies 详情</h3>
+<h3 class="text-sm font-medium text-slate-300 mb-3">Cookies 详情
+<span v-if="cookieData.masked_values" class="text-xs font-normal text-amber-400 ml-2">（值已脱敏，明文需 DOUBAO_ENABLE_ADMIN_DEBUG=true）</span></h3>
 <div v-if="cookieData.file" class="mb-3 p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-xs">
 <span class="text-slate-400">来源:</span> <span class="text-brand-400 mr-4">{{cookieData.file.source}}</span>
 <span class="text-slate-400">时间:</span> <span class="text-white mr-4">{{cookieData.file.timestamp?new Date(cookieData.file.timestamp*1000).toLocaleString('zh-CN'):'N/A'}}</span>
@@ -122,7 +120,7 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 <tbody><tr v-for="(c,i) in cookieData.cookies" :key="c.name" class="border-b border-slate-800 hover:bg-slate-800/30">
 <td class="py-1.5 pr-4 text-slate-500">{{i+1}}</td>
 <td class="py-1.5 pr-4 font-mono text-brand-300 whitespace-nowrap">{{c.name}}</td>
-<td class="py-1.5 pr-4 font-mono text-slate-300 text-xs break-all max-w-md">{{c.value}}</td>
+<td class="py-1.5 pr-4 font-mono text-slate-300 text-xs break-all max-w-md">{{c.value||c.value_masked||'***'}}</td>
 <td class="py-1.5 text-slate-500">{{c.length}}</td></tr></tbody></table>
 </div>
 <div v-else class="text-slate-500 text-center py-6">暂无 Cookie 数据，请先登录</div>
@@ -209,15 +207,14 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 <div class="overflow-x-auto"><table class="w-full text-sm">
 <thead><tr class="text-left text-xs text-slate-500 border-b border-slate-700">
 <th class="py-2 px-3">时间</th><th class="py-2 px-3">方法</th><th class="py-2 px-3">路径</th>
-<th class="py-2 px-3">模型</th><th class="py-2 px-3">状态</th><th class="py-2 px-3">耗时</th></tr></thead>
+<th class="py-2 px-3">状态</th><th class="py-2 px-3">耗时</th></tr></thead>
 <tbody><tr v-for="(l,i) in logs" :key="i" class="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
 <td class="py-2 px-3 text-slate-400 font-mono text-xs">{{fmtTime(l.ts)}}</td>
 <td class="py-2 px-3"><span class="px-1.5 py-0.5 rounded text-xs font-medium" :class="l.method==='POST'?'bg-amber-900/40 text-amber-300':'bg-blue-900/40 text-blue-300'">{{l.method}}</span></td>
 <td class="py-2 px-3 font-mono text-xs text-slate-300">{{l.path}}</td>
-<td class="py-2 px-3 text-xs text-brand-400">{{l.model||'-'}}</td>
 <td class="py-2 px-3"><span :class="l.status<400?'text-green-400':'text-red-400'" class="font-mono">{{l.status}}</span></td>
 <td class="py-2 px-3 text-slate-400 font-mono">{{l.ms}}ms</td></tr>
-<tr v-if="!logs.length"><td colspan="6" class="py-8 text-center text-slate-500">暂无请求记录</td></tr>
+<tr v-if="!logs.length"><td colspan="5" class="py-8 text-center text-slate-500">暂无请求记录</td></tr>
 </tbody></table></div></div></section>
 </div></div></div>
 <script>
@@ -236,14 +233,14 @@ const icons=[
 const activeTab=ref(0);
 const session=ref(null);
 const sysInfo=ref(null);
-const cookieData=reactive({cookies:[],total:0,file:null});
+const cookieData=reactive({cookies:[],total:0,file:null,masked_values:false});
 const probe=reactive({loading:false,result:'',ms:0,time:''});
 const qr=reactive({img:'',st:'',text:'等待生成'});
 const test=reactive({model:'doubao-think',stream:true,prompt:'',output:'',thinking:'',thinkOpen:true,error:'',loading:false,ms:0,searchResults:null});
 const logs=ref([]);
 const screenshot=reactive({img:"",loading:false,time:""});
 const currentTime=ref('');
-const allModels=['doubao','doubao-quick','doubao-think','doubao-auto','doubao-expert','doubao-pro','doubao-image','doubao-video','doubao-music'];
+const allModels=['doubao','doubao-think','doubao-expert','doubao-pro','doubao-image','doubao-video','doubao-music'];
 const qrColor=computed(()=>({'text-green-400':qr.st==='success'||qr.st==='confirmed','text-yellow-400':qr.st==='scanned','text-slate-400':qr.st==='waiting_scan','text-red-400':qr.st==='expired'||qr.st==='failed'}));
 function fmtDur(s){if(!s&&s!==0)return'N/A';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(ts){if(!ts)return'';return new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false})}
@@ -251,11 +248,11 @@ async function api(path,opts={}){const r=await fetch(API+path,{headers,...opts})
 async function fetchSession(){try{const d=await api('/admin/api/status');session.value={status:d.logged_in?'healthy':'not_logged_in',logged_in:d.logged_in}}catch(e){session.value={status:'error',logged_in:false}}}
 async function probeSession(){probe.loading=true;probe.result='';const t0=Date.now();
 try{const r=await api('/admin/api/probe',{method:'POST'});probe.result=r.status||'error';probe.ms=Date.now()-t0;
-probe.time=new Date().toLocaleTimeString('zh-CN',{hour12:false});session.value=r}
+probe.time=new Date().toLocaleTimeString('zh-CN',{hour12:false});fetchSession()}
 catch(e){probe.result='error';probe.ms=Date.now()-t0;probe.time=new Date().toLocaleTimeString('zh-CN',{hour12:false})}
 finally{probe.loading=false}}
 async function fetchSystem(){try{sysInfo.value=await api('/admin/api/system')}catch(e){}}
-async function fetchCookies(){try{const d=await api('/admin/api/cookies');cookieData.cookies=d.cookies||[];cookieData.total=d.total||0;cookieData.file=d.session_file||null}catch(e){}}
+async function fetchCookies(){try{const d=await api('/admin/api/cookies');cookieData.cookies=d.cookies||[];cookieData.total=d.total||0;cookieData.masked_values=!!d.masked_values;cookieData.file=d.session_file||null}catch(e){}}
 async function fetchLogs(){try{logs.value=(await api('/admin/api/logs')).reverse()}catch(e){}}
 async function fetchOverview(){fetchSession();fetchSystem();fetchCookies()}
 let qrPoll=null;

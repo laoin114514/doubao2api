@@ -1,21 +1,42 @@
 """
 Phase 1: Context Window Capacity Test for doubao-expert with tool calling.
 
+Manual/live test - requires a running doubao2api server with a logged-in
+browser session. It is NOT part of the offline pytest suite and is never run
+in CI; run it directly as a script.
+
 Tests:
 1. Input limit: progressively larger prompts with full tool definitions
 2. Output limit: ask model to generate long responses
 3. Failure behavior: what happens when limit is exceeded
 
 Usage:
-    python tests/test_context_window.py --base-url http://103.237.92.203:9090
+    DOUBAO_BASE_URL=http://127.0.0.1:9090 DOUBAO_API_KEY=sk-... \
+        python tests/test_context_window.py
+
+    python tests/test_context_window.py \
+        --base-url http://127.0.0.1:9090 --api-key "$DOUBAO_API_KEY"
 """
 import argparse
 import json
+import os
 import time
-import httpx
-import sys
 
-BASE_URL = "http://103.237.92.203:9090"
+import httpx
+
+BASE_URL = os.environ.get("DOUBAO_BASE_URL", "http://127.0.0.1:9090")
+
+# This module is a manual live script, not a pytest test module. Pytest honours
+# this flag and leaves it alone (the functions below are not offline tests).
+__test__ = False
+
+
+def _auth_headers(api_key: str) -> dict:
+    """Build request headers, adding bearer auth when an API key is configured."""
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
+
 
 # Full OpenCode-style tool definitions (English, 8 tools)
 TOOLS = [
@@ -196,7 +217,7 @@ def generate_code_padding(char_count: int) -> str:
     return (snippet * repeats)[:char_count]
 
 
-def test_input_limit(base_url: str):
+def test_input_limit(base_url: str, api_key: str = ""):
     """Test input context limit by sending progressively larger prompts."""
     print("\n" + "=" * 60)
     print("TEST 1: INPUT CONTEXT LIMIT")
@@ -230,6 +251,7 @@ def test_input_limit(base_url: str):
             resp = httpx.post(
                 f"{base_url}/v1/chat/completions",
                 json=payload,
+                headers=_auth_headers(api_key),
                 timeout=120.0,
             )
             elapsed = time.time() - start
@@ -239,7 +261,7 @@ def test_input_limit(base_url: str):
                 choice = data["choices"][0]
                 content = choice["message"].get("content") or ""
                 tool_calls = choice["message"].get("tool_calls")
-                finish = choice.get("finish_reason") or choice["finish_reason"]
+                finish = choice.get("finish_reason") or "stop"
                 print(f"  OK ({elapsed:.1f}s) | finish={finish} | response_len={len(content)} | tool_calls={bool(tool_calls)}")
                 results.append({"size": size, "status": "ok", "elapsed": elapsed, "response_len": len(content)})
             else:
@@ -257,7 +279,7 @@ def test_input_limit(base_url: str):
     return results
 
 
-def test_output_limit(base_url: str):
+def test_output_limit(base_url: str, api_key: str = ""):
     """Test output generation limit."""
     print("\n" + "=" * 60)
     print("TEST 2: OUTPUT LENGTH LIMIT")
@@ -277,7 +299,12 @@ def test_output_limit(base_url: str):
         print(f"\n--- Testing output: {label} ---")
         start = time.time()
         try:
-            resp = httpx.post(f"{base_url}/v1/chat/completions", json=payload, timeout=180.0)
+            resp = httpx.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers=_auth_headers(api_key),
+                timeout=180.0,
+            )
             elapsed = time.time() - start
             if resp.status_code == 200:
                 data = resp.json()
@@ -297,7 +324,7 @@ def test_output_limit(base_url: str):
     return results
 
 
-def test_multi_turn_growth(base_url: str):
+def test_multi_turn_growth(base_url: str, api_key: str = ""):
     """Test context growth in multi-turn with tool results."""
     print("\n" + "=" * 60)
     print("TEST 3: MULTI-TURN CONTEXT GROWTH")
@@ -331,7 +358,12 @@ def test_multi_turn_growth(base_url: str):
 
         start = time.time()
         try:
-            resp = httpx.post(f"{base_url}/v1/chat/completions", json=payload, timeout=120.0)
+            resp = httpx.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers=_auth_headers(api_key),
+                timeout=120.0,
+            )
             elapsed = time.time() - start
             if resp.status_code == 200:
                 data = resp.json()
@@ -347,7 +379,7 @@ def test_multi_turn_growth(base_url: str):
                 results.append({"turn": turn, "payload_size": payload_size, "status": f"http_{resp.status_code}", "error": error_text})
                 break  # Stop on error
         except httpx.TimeoutException:
-            print(f"  TIMEOUT")
+            print("  TIMEOUT")
             results.append({"turn": turn, "payload_size": payload_size, "status": "timeout"})
             break
         except Exception as e:
@@ -360,23 +392,33 @@ def test_multi_turn_growth(base_url: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Context window capacity test")
-    parser.add_argument("--base-url", default=BASE_URL)
+    parser.add_argument(
+        "--base-url",
+        default=BASE_URL,
+        help="doubao2api base URL (env: DOUBAO_BASE_URL)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("DOUBAO_API_KEY", ""),
+        help="Bearer token for the proxy (env: DOUBAO_API_KEY)",
+    )
     parser.add_argument("--test", choices=["input", "output", "growth", "all"], default="all")
     args = parser.parse_args()
 
     print(f"Target: {args.base_url}")
+    print(f"Auth: {'bearer token configured' if args.api_key else 'no API key'}")
     print(f"Tools: {len(TOOLS)} definitions")
 
     all_results = {}
 
     if args.test in ("input", "all"):
-        all_results["input"] = test_input_limit(args.base_url)
+        all_results["input"] = test_input_limit(args.base_url, args.api_key)
 
     if args.test in ("output", "all"):
-        all_results["output"] = test_output_limit(args.base_url)
+        all_results["output"] = test_output_limit(args.base_url, args.api_key)
 
     if args.test in ("growth", "all"):
-        all_results["growth"] = test_multi_turn_growth(args.base_url)
+        all_results["growth"] = test_multi_turn_growth(args.base_url, args.api_key)
 
     # Summary
     print("\n" + "=" * 60)

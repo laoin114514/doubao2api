@@ -11,9 +11,9 @@ Official format:
   </tool_call>
 """
 import json
+import logging
 import re
 import uuid
-import logging
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ def _compress_type(pinfo: dict) -> str:
 
 def _compress_params(params: dict) -> str:
     """Compress JSON Schema parameters to TS-like signature.
-    
+
     Example output: {file_path!: string, encoding?: "utf-8"|"base64"}
     '!' = required, '?' = optional
     """
@@ -69,7 +69,7 @@ def _compress_params(params: dict) -> str:
     required = set(params.get("required", []))
     if not props:
         return "{}"
-    
+
     parts = []
     for pname, pinfo in props.items():
         marker = "!" if pname in required else "?"
@@ -99,13 +99,13 @@ PRIORITY_TOOLS = {
 
 def format_tools_for_prompt(tools: list[dict[str, Any]]) -> str:
     """Convert OpenAI-format tools array to compressed TS-like signatures.
-    
+
     Uses compact notation for ~90% space savings vs verbose JSON Schema.
     Priority tools get full param expansion; others get name+desc only when >12 tools.
     """
     lines = []
     expand_all = len(tools) <= 12
-    
+
     for tool in tools:
         if tool.get("type") != "function":
             continue
@@ -113,9 +113,9 @@ def format_tools_for_prompt(tools: list[dict[str, Any]]) -> str:
         name = func.get("name", "unknown")
         desc = func.get("description", "")
         params = func.get("parameters", {})
-        
+
         is_priority = expand_all or name in PRIORITY_TOOLS
-        
+
         if is_priority:
             sig = _compress_params(params)
             # Truncate description to 120 chars for prompt space
@@ -125,7 +125,7 @@ def format_tools_for_prompt(tools: list[dict[str, Any]]) -> str:
             # Minimal: just name and short description
             short_desc = desc[:80] + "..." if len(desc) > 80 else desc
             lines.append(f"- {name}: {short_desc}")
-    
+
     return "\n".join(lines)
 
 
@@ -191,17 +191,38 @@ def _try_parse_json(json_str: str) -> Optional[dict]:
         return None
 
 
-def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
+def parse_tool_calls_xml(
+    text: str,
+    valid_tool_names: Optional[set[str]] = None,
+) -> Optional[list[dict[str, Any]]]:
     """Parse tool_call blocks from model output.
-    
+
     Supports both:
     - Official format: <tool_call>{"name":..., "arguments":...}</tool_call>
     - Legacy format: <tool_calls><invoke name="...">...</invoke></tool_calls>
-    
+
+    Args:
+        text: Raw model output.
+        valid_tool_names: Optional whitelist of function names declared by the
+            client. When provided, calls whose name is not in the whitelist
+            (hallucinated/unknown tools) are dropped. When None, no filtering
+            is applied (legacy behaviour).
+
     Returns list of OpenAI-format tool_call dicts, or None if not found.
     """
     tool_calls = []
-    
+
+    def _accept(name: Any) -> bool:
+        """Return True when the parsed tool name is allowed."""
+        if not isinstance(name, str) or not name:
+            return valid_tool_names is None
+        if valid_tool_names is None:
+            return True
+        return name in valid_tool_names
+
+    def _reject(name: Any) -> None:
+        log.warning("Dropping tool call with unknown tool name: %r", name)
+
     # Try official format first
     for m in _TOOL_CALL_RE.finditer(text):
         json_str = m.group(1).strip()
@@ -228,6 +249,9 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
                 continue
         try:
             name = obj.get("name", "")
+            if not _accept(name):
+                _reject(name)
+                continue
             arguments = obj.get("arguments", {})
             if isinstance(arguments, dict):
                 arguments = json.dumps(arguments, ensure_ascii=False)
@@ -241,16 +265,19 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
         except (AttributeError, TypeError) as e:
             log.warning("Failed to extract tool_call fields: %s", e)
             continue
-    
+
     if tool_calls:
         return tool_calls
-    
+
     # Fallback 2: partial format (missing opening <tool_call> tag, common in thinking mode)
     if "</tool_call>" in text:
         for m in _TOOL_CALL_PARTIAL_RE.finditer(text):
             json_str = m.group(1).strip()
             obj = _try_parse_json(json_str)
             if obj and isinstance(obj, dict) and "name" in obj:
+                if not _accept(obj["name"]):
+                    _reject(obj.get("name"))
+                    continue
                 arguments = obj.get("arguments", {})
                 if isinstance(arguments, dict):
                     arguments = json.dumps(arguments, ensure_ascii=False)
@@ -270,6 +297,9 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
             json_str = m.group(1).strip()
             obj = _try_parse_json(json_str)
             if obj and isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                if not _accept(obj["name"]):
+                    _reject(obj.get("name"))
+                    continue
                 arguments = obj.get("arguments", {})
                 if isinstance(arguments, dict):
                     arguments = json.dumps(arguments, ensure_ascii=False)
@@ -290,6 +320,9 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
     inner = match.group(1)
     for invoke_match in _INVOKE_RE.finditer(inner):
         func_name = invoke_match.group(1)
+        if not _accept(func_name):
+            _reject(func_name)
+            continue
         params_text = invoke_match.group(2)
         arguments = {}
         for param_match in _PARAM_RE.finditer(params_text):
@@ -304,7 +337,7 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
                 "arguments": json.dumps(arguments, ensure_ascii=False),
             },
         })
-    
+
     return tool_calls if tool_calls else None
 
 
@@ -362,7 +395,7 @@ def convert_messages_with_tools(
     max_chars: int = MAX_PROMPT_CHARS,
 ) -> str:
     """Convert OpenAI-format messages (including role:tool) to plain text prompt.
-    
+
     Handles:
     - Injects tool system prompt
     - Converts role:assistant with tool_calls to official format
@@ -373,23 +406,23 @@ def convert_messages_with_tools(
     tool_system = build_tool_system_prompt(tools)
     parts = []
     first_user_msg = None  # Track the original task
-    
+
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
-        
+
         if role == "system":
             if content:
                 parts.append(f"[system]: {content}\n\n{tool_system}")
             continue
-        
+
         elif role == "tool":
             name = msg.get("name", "unknown_tool")
             tool_content = _truncate_tool_result(content or "")
             parts.append(TOOL_RESULT_TEMPLATE.format(
                 name=name, content=tool_content
             ))
-        
+
         elif role == "assistant":
             tool_calls = msg.get("tool_calls")
             if tool_calls:
@@ -397,47 +430,47 @@ def convert_messages_with_tools(
                 parts.append(f"[assistant]: {xml}")
             elif content:
                 parts.append(f"[assistant]: {content}")
-        
+
         elif role == "user":
             text = ""
             if isinstance(content, str):
                 text = content
             elif isinstance(content, list):
-                text_parts = [p.get("text", "") for p in content 
+                text_parts = [p.get("text", "") for p in content
                              if isinstance(p, dict) and p.get("type") == "text"]
                 text = "".join(text_parts)
             if text:
                 if first_user_msg is None:
                     first_user_msg = text
                 parts.append(f"[user]: {text}")
-    
+
     # If no system message was found, prepend tool system prompt
     if not any(m.get("role") == "system" for m in messages):
         parts.insert(0, f"[system]: {tool_system}")
-    
+
     # Inject few-shot examples after system prompt, before real history
     fewshot = build_fewshot_examples(tools)
     if fewshot:
         parts = parts[:1] + fewshot + parts[1:]
-    
+
     # Clean refusals from history to prevent cascade
     parts = clean_refusals_from_history(parts)
-    
+
     # Context offload: compress very long individual messages
     parts = offload_long_messages(parts)
-    
+
     result = "\n\n".join(parts)
-    
+
     # If still over limit after per-result truncation, drop oldest tool rounds
     if len(result) > max_chars:
         result = _drop_old_rounds(parts, max_chars, first_user_msg)
-    
+
     return result
 
 
 def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[str] = None) -> str:
     """Drop oldest tool call/result pairs until under the limit.
-    
+
     Strategy:
     1. If system prompt is too large, truncate it
     2. Always preserve first user message (original task) for context
@@ -446,9 +479,9 @@ def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[
     """
     if not parts:
         return ""
-    
+
     header = parts[0]  # system prompt (may be very large)
-    
+
     # If header alone exceeds 50% of budget, truncate it aggressively
     max_header = int(max_chars * 0.5)
     if len(header) > max_header:
@@ -465,7 +498,7 @@ def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[
         # If still too large, truncate tool definitions too
         if len(header) > max_header:
             header = header[:max_header] + "\n[... truncated ...]"
-    
+
     # Build CURRENT TASK reminder from first user message
     task_reminder = ""
     if first_user_msg:
@@ -474,18 +507,18 @@ def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[
         if len(first_user_msg) > 500:
             task_text += "..."
         task_reminder = f"\n\n[CURRENT TASK]: {task_text}"
-    
+
     # Calculate budget for conversation history
     budget = max_chars - len(header) - len(task_reminder) - 200
-    
+
     # Ensure minimum budget for at least some history
     if budget < 5000:
         budget = 5000
-    
+
     # Keep parts from the end (most recent first)
     kept_tail = []
     tail_size = 0
-    
+
     for part in reversed(parts[1:]):
         part_size = len(part) + 4  # +4 for "\n\n" separator
         if tail_size + part_size <= budget:
@@ -493,12 +526,12 @@ def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[
             tail_size += part_size
         else:
             break
-    
+
     # If we couldn't keep anything, force-keep at least the last 2 parts
     if not kept_tail and len(parts) > 1:
         kept_tail = parts[-2:]
         kept_tail = [p[:3000] if len(p) > 3000 else p for p in kept_tail]
-    
+
     dropped_count = len(parts) - 1 - len(kept_tail)
     if dropped_count > 0:
         marker = f"[... {dropped_count} earlier messages omitted ...]"
@@ -547,7 +580,7 @@ _REFUSAL_REPLACEMENT = "[earlier assistant turn omitted by proxy]"
 
 def clean_refusals_from_history(parts: list[str]) -> list[str]:
     """Remove refusal text from assistant messages in history.
-    
+
     Prevents cascade refusals where model sees its own prior refusal
     and repeats it. Only cleans assistant messages, preserves tool_call blocks.
     """
@@ -573,37 +606,37 @@ def clean_refusals_from_history(parts: list[str]) -> list[str]:
 # ── Streaming Guard ──
 class StreamingGuard:
     """Buffer for streaming output to detect incomplete tool_call tags.
-    
+
     Accumulates initial chars (warmup) before emitting, and keeps a guard
     window at the tail to detect cross-chunk tool_call boundaries.
     """
-    
+
     WARMUP_CHARS = 80       # Buffer before first emit
     GUARD_WINDOW = 200      # Tail buffer for cross-chunk detection
-    
+
     def __init__(self):
         self._buffer = ""
         self._emitted = 0
         self._warmed_up = False
-    
+
     def feed(self, chunk: str) -> str:
         """Feed a chunk, return text safe to emit (may be empty during warmup)."""
         self._buffer += chunk
-        
+
         if not self._warmed_up:
             if len(self._buffer) < self.WARMUP_CHARS:
                 return ""
             self._warmed_up = True
-        
+
         # Keep guard window at tail
         safe_end = len(self._buffer) - self.GUARD_WINDOW
         if safe_end <= self._emitted:
             return ""
-        
+
         emit = self._buffer[self._emitted:safe_end]
         self._emitted = safe_end
         return emit
-    
+
     def flush(self) -> str:
         """Flush remaining buffer (call at stream end)."""
         if self._emitted < len(self._buffer):
@@ -611,12 +644,12 @@ class StreamingGuard:
             self._emitted = len(self._buffer)
             return emit
         return ""
-    
+
     @property
     def full_buffer(self) -> str:
         """Get the complete accumulated buffer."""
         return self._buffer
-    
+
     def has_incomplete_tool_call(self) -> bool:
         """Check if buffer has an opening <tool_call> without matching close."""
         opens = self._buffer.count("<tool_call>")
@@ -628,7 +661,7 @@ class StreamingGuard:
 
 def detect_truncated_tool_call(text: str) -> bool:
     """Detect if model output was truncated mid-tool-call.
-    
+
     Returns True if there's an unclosed <tool_call> tag or incomplete JSON.
     """
     opens = text.count("<tool_call>")
@@ -644,7 +677,7 @@ def detect_truncated_tool_call(text: str) -> bool:
 
 def build_continuation_prompt(original_output: str, max_anchor: int = 2000) -> str:
     """Build a prompt to continue from where the model was truncated.
-    
+
     Takes the tail of the original output as anchor context.
     """
     anchor = original_output[-max_anchor:] if len(original_output) > max_anchor else original_output
@@ -661,21 +694,21 @@ def build_continuation_prompt(original_output: str, max_anchor: int = 2000) -> s
 
 def _extract_tokens(text: str) -> set:
     """Extract meaningful tokens from text for similarity comparison.
-    
+
     Handles both Latin (word-based) and CJK (character bigram) text.
     """
     tokens = set()
     # Split on whitespace/punctuation for Latin words
     words = re.split(r'[\s\W_]+', text.lower())
     tokens.update(t for t in words if len(t) >= 2)
-    
+
     # For CJK: extract character bigrams (2-char sliding window)
     # CJK Unified Ideographs range: \u4e00-\u9fff
     cjk_chars = re.findall(r'[\u4e00-\u9fff]', text)
     if len(cjk_chars) >= 2:
         for i in range(len(cjk_chars) - 1):
             tokens.add(cjk_chars[i] + cjk_chars[i + 1])
-    
+
     return tokens
 
 
@@ -694,24 +727,24 @@ TOPIC_SIMILARITY_THRESHOLD = 0.10
 
 def detect_topic_change(prev_user_msg: str, new_user_msg: str) -> bool:
     """Detect if the new user message is about a completely different topic.
-    
+
     Uses Jaccard similarity on token sets. Returns True if the messages
     are dissimilar enough to warrant discarding old history.
-    
+
     Only triggers on substantial messages (>10 chars) to avoid false positives
     on short follow-ups like "yes", "continue", "fix it".
     """
     # Short messages are likely follow-ups, not new topics
     if len(new_user_msg) < 10 or len(prev_user_msg) < 10:
         return False
-    
+
     tokens_prev = _extract_tokens(prev_user_msg)
     tokens_new = _extract_tokens(new_user_msg)
-    
+
     # Need enough tokens to make a meaningful comparison
     if len(tokens_prev) < 3 or len(tokens_new) < 3:
         return False
-    
+
     similarity = _jaccard_similarity(tokens_prev, tokens_new)
     return similarity < TOPIC_SIMILARITY_THRESHOLD
 
@@ -721,27 +754,27 @@ def filter_history_by_topic(
     max_history_on_change: int = 2,
 ) -> list[dict[str, Any]]:
     """Filter message history when a topic change is detected.
-    
+
     If the latest user message is about a different topic than the previous
     user message, keep only the system prompt + last N messages.
     This frees up context budget for the new task.
-    
+
     Args:
         messages: Full message list (OpenAI format)
         max_history_on_change: How many recent messages to keep on topic change
-    
+
     Returns:
         Filtered message list (may be shorter if topic changed)
     """
     # Find the last two user messages
     user_msgs = [(i, m) for i, m in enumerate(messages) if m.get("role") == "user"]
-    
+
     if len(user_msgs) < 2:
         return messages  # Not enough history to compare
-    
+
     prev_idx, prev_msg = user_msgs[-2]
     curr_idx, curr_msg = user_msgs[-1]
-    
+
     # Extract text content
     prev_text = prev_msg.get("content", "")
     curr_text = curr_msg.get("content", "")
@@ -749,7 +782,7 @@ def filter_history_by_topic(
         prev_text = " ".join(p.get("text", "") for p in prev_text if isinstance(p, dict))
     if isinstance(curr_text, list):
         curr_text = " ".join(p.get("text", "") for p in curr_text if isinstance(p, dict))
-    
+
     if detect_topic_change(prev_text, curr_text):
         log.info("Topic change detected (prev=%s... -> new=%s...), trimming history",
                  prev_text[:30], curr_text[:30])
@@ -757,7 +790,7 @@ def filter_history_by_topic(
         system_msgs = [m for m in messages if m.get("role") == "system"]
         recent = messages[-max_history_on_change:]
         return system_msgs + recent
-    
+
     return messages
 
 
@@ -788,7 +821,7 @@ _OBFUSCATION_PREFIX = "u_"
 
 class ToolNameObfuscator:
     """Handles bidirectional tool name obfuscation.
-    
+
     Usage:
         obf = ToolNameObfuscator(enabled=True)
         # Before sending to model:
@@ -797,12 +830,12 @@ class ToolNameObfuscator:
         # After receiving from model:
         original_name = obf.deobfuscate_name(model_output_name)
     """
-    
+
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
         self._custom_map: dict[str, str] = {}      # original -> obfuscated
         self._custom_reverse: dict[str, str] = {}  # obfuscated -> original
-    
+
     def obfuscate_name(self, name: str) -> str:
         """Convert original tool name to obfuscated name."""
         if not self.enabled:
@@ -818,7 +851,7 @@ class ToolNameObfuscator:
         self._custom_map[name] = obf_name
         self._custom_reverse[obf_name] = name
         return obf_name
-    
+
     def deobfuscate_name(self, name: str) -> str:
         """Convert obfuscated name back to original."""
         if not self.enabled:
@@ -833,7 +866,7 @@ class ToolNameObfuscator:
         if name.startswith(_OBFUSCATION_PREFIX):
             return name[len(_OBFUSCATION_PREFIX):]
         return name
-    
+
     def obfuscate_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Create a copy of tools with obfuscated names."""
         if not self.enabled:
@@ -855,7 +888,7 @@ class ToolNameObfuscator:
             }
             result.append(new_tool)
         return result
-    
+
     def obfuscate_prompt_text(self, text: str) -> str:
         """Replace bare tool names in prompt text with obfuscated versions."""
         if not self.enabled:
@@ -866,7 +899,7 @@ class ToolNameObfuscator:
         for original, obfuscated in self._custom_map.items():
             text = re.sub(rf'\b{re.escape(original)}\b', obfuscated, text)
         return text
-    
+
     def deobfuscate_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -895,14 +928,14 @@ class ToolNameObfuscator:
 
 def _select_representative_tools(tools: list[dict[str, Any]], max_examples: int = 3) -> list[dict]:
     """Select representative tools for few-shot examples.
-    
+
     Strategy:
     - Always include 1 core tool (Read/Edit/Shell)
     - Pick up to 2 more from different "namespaces" (by prefix/category)
     """
     if not tools:
         return []
-    
+
     funcs = []
     for t in tools:
         if t.get("type") != "function":
@@ -910,26 +943,26 @@ def _select_representative_tools(tools: list[dict[str, Any]], max_examples: int 
         f = t.get("function", {})
         if f.get("name"):
             funcs.append(f)
-    
+
     if not funcs:
         return []
-    
+
     # Categorize: core vs others
     core_names = {"Read", "Edit", "Shell", "Bash", "Write", "Glob", "Grep",
                   "read", "edit", "shell", "bash", "write", "glob", "grep",
                   "fs_read_file", "fs_edit_file", "exec_shell", "exec_command"}
-    
+
     core = [f for f in funcs if f["name"] in core_names]
     others = [f for f in funcs if f["name"] not in core_names]
-    
+
     selected = []
     # Pick 1 core tool
     if core:
         selected.append(core[0])
-    
+
     # Pick from others (prefer those with longer descriptions = more complex)
     others.sort(key=lambda f: len(f.get("description", "")), reverse=True)
-    
+
     # Deduplicate by "namespace" (first word or prefix before _)
     seen_ns = set()
     for f in others:
@@ -937,20 +970,20 @@ def _select_representative_tools(tools: list[dict[str, Any]], max_examples: int 
         if ns not in seen_ns and len(selected) < max_examples:
             selected.append(f)
             seen_ns.add(ns)
-    
+
     return selected
 
 
 def _build_fewshot_example(func: dict) -> tuple[str, str]:
     """Build a synthetic user->assistant example for a tool.
-    
+
     Returns (user_msg, assistant_msg) tuple.
     """
     name = func.get("name", "tool")
     params = func.get("parameters", {})
     props = params.get("properties", {})
     required = set(params.get("required", []))
-    
+
     # Build a minimal valid arguments dict
     args = {}
     for pname, pinfo in props.items():
@@ -967,7 +1000,7 @@ def _build_fewshot_example(func: dict) -> tuple[str, str]:
             args[pname] = []
         else:
             args[pname] = f"example_{pname}"
-    
+
     user_msg = f"[example] use {name}"
     assistant_msg = (
         f'<tool_call>\n'
@@ -979,23 +1012,23 @@ def _build_fewshot_example(func: dict) -> tuple[str, str]:
 
 def build_fewshot_examples(tools: list[dict[str, Any]]) -> list[str]:
     """Build few-shot example parts to inject before real conversation.
-    
+
     Returns list of parts in the same format as convert_messages_with_tools.
     Only generates examples when there are >5 tools (simple cases don't need it).
     """
     if len(tools) <= 5:
         return []
-    
+
     representatives = _select_representative_tools(tools)
     if not representatives:
         return []
-    
+
     parts = []
     for func in representatives:
         user_msg, assistant_msg = _build_fewshot_example(func)
         parts.append(f"[user]: {user_msg}")
         parts.append(f"[assistant]: {assistant_msg}")
-    
+
     return parts
 
 
@@ -1012,24 +1045,24 @@ OFFLOAD_TAIL_CHARS = 800       # Keep this many chars from the end
 
 def offload_long_messages(parts: list[str], threshold: int = OFFLOAD_MSG_THRESHOLD) -> list[str]:
     """Compress messages that exceed the threshold.
-    
+
     For very long messages (typically tool results or system prompts),
     keep head + tail and replace the middle with a size marker.
     This is the equivalent of qwen2API's context_offload but without
     requiring file upload infrastructure.
-    
+
     Skips the first part (system prompt) — that's handled by _drop_old_rounds.
     """
     if not parts:
         return parts
-    
+
     result = [parts[0]]  # Keep system prompt as-is (handled elsewhere)
-    
+
     for part in parts[1:]:
         if len(part) <= threshold:
             result.append(part)
             continue
-        
+
         # Determine what kind of message this is
         if part.startswith("[工具调用结果]"):
             # Tool result: keep head + tail
@@ -1063,7 +1096,7 @@ def offload_long_messages(parts: list[str], threshold: int = OFFLOAD_MSG_THRESHO
             result.append(
                 f"{head}\n[... {omitted} chars omitted ...]\n{tail}"
             )
-    
+
     return result
 
 
@@ -1158,7 +1191,7 @@ _PARAM_COERCION_MAP = {
 
 def coerce_tool_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fix common parameter name mistakes in tool calls.
-    
+
     Maps wrong parameter names to correct ones based on the tool name.
     Modifies tool_calls in place and returns them.
     """
@@ -1166,19 +1199,19 @@ def coerce_tool_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, An
         func = tc.get("function", {})
         name = func.get("name", "")
         args_str = func.get("arguments", "{}")
-        
+
         coercion = _PARAM_COERCION_MAP.get(name)
         if not coercion:
             continue
-        
+
         try:
             args = json.loads(args_str)
         except (json.JSONDecodeError, TypeError):
             continue
-        
+
         if not isinstance(args, dict):
             continue
-        
+
         # Apply coercion: rename wrong keys to correct keys
         changed = False
         new_args = {}
@@ -1193,12 +1226,12 @@ def coerce_tool_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, An
                     new_args[key] = value  # Keep original if conflict
             else:
                 new_args[key] = value
-        
+
         if changed:
             log.info("Coerced params for %s: %s", name,
                      {k: coercion[k] for k in args if k in coercion})
             func["arguments"] = json.dumps(new_args, ensure_ascii=False)
-    
+
     return tool_calls
 
 
@@ -1207,14 +1240,14 @@ def coerce_tool_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, An
 
 def _find_longest_overlap(text_a: str, text_b: str, max_check: int = 500) -> int:
     """Find the longest suffix of text_a that is a prefix of text_b.
-    
+
     Returns the length of the overlap (0 if none found).
     Checks up to max_check characters for performance.
     """
     # Limit search window
     suffix_window = text_a[-max_check:] if len(text_a) > max_check else text_a
     prefix_window = text_b[:max_check] if len(text_b) > max_check else text_b
-    
+
     best = 0
     # Try decreasing overlap lengths
     max_possible = min(len(suffix_window), len(prefix_window))
@@ -1222,22 +1255,22 @@ def _find_longest_overlap(text_a: str, text_b: str, max_check: int = 500) -> int
         if suffix_window[-length:] == prefix_window[:length]:
             best = length
             break
-    
+
     return best
 
 
 def _find_line_overlap(text_a: str, text_b: str, max_lines: int = 20) -> int:
     """Find overlap at line boundaries (more robust than char-level).
-    
+
     Returns number of characters to skip from text_b.
     """
     lines_a = text_a.split("\n")
     lines_b = text_b.split("\n")
-    
+
     # Check last N lines of A against first N lines of B
     tail_lines = lines_a[-max_lines:] if len(lines_a) > max_lines else lines_a
     head_lines = lines_b[:max_lines] if len(lines_b) > max_lines else lines_b
-    
+
     # Find longest matching sequence
     best_overlap_chars = 0
     for start in range(len(tail_lines)):
@@ -1252,13 +1285,13 @@ def _find_line_overlap(text_a: str, text_b: str, max_lines: int = 20) -> int:
             overlap_chars = sum(len(line) + 1 for line in head_lines[:match_len])
             if overlap_chars > best_overlap_chars:
                 best_overlap_chars = overlap_chars
-    
+
     return best_overlap_chars
 
 
 def deduplicate_continuation(original: str, continuation: str) -> str:
     """Join original output with continuation, removing any overlap.
-    
+
     Uses both character-level and line-level overlap detection.
     Returns the combined, deduplicated text.
     """
@@ -1266,16 +1299,16 @@ def deduplicate_continuation(original: str, continuation: str) -> str:
         return original
     if not original:
         return continuation
-    
+
     # Try line-level overlap first (more robust)
     line_overlap = _find_line_overlap(original, continuation)
-    
+
     # Try character-level overlap
     char_overlap = _find_longest_overlap(original, continuation)
-    
+
     # Use the larger overlap
     overlap = max(line_overlap, char_overlap)
-    
+
     if overlap > 0:
         log.info("Deduplication: removed %d chars of overlap", overlap)
         return original + continuation[overlap:]

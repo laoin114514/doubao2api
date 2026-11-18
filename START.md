@@ -22,7 +22,7 @@ curl http://127.0.0.1:9090/health
 ## 1. 日常启动（服务没在跑时）
 
 ```bash
-cd C:/Users/29084/Desktop/code/zcodeWorkspace/doubao2api
+cd doubao2api
 bash ./start.sh
 ```
 
@@ -45,22 +45,33 @@ curl http://127.0.0.1:9090/health
 
 ### 2.1 安装依赖
 ```bash
-cd C:/Users/29084/Desktop/code/zcodeWorkspace/doubao2api
+cd doubao2api
 pip install -r requirements.txt
 pip install playwright-stealth
 python -m playwright install chromium        # 下载浏览器二进制（约 150MB）
 ```
 
-### 2.2 登录豆包（首次必做，登录态存 doubao-proxy/profile）
+### 2.2 登录豆包（首次必做，登录态存 `DOUBAO_BROWSER_DATA`，默认 `~/.doubao_browser`）
+
+方式一（推荐，图形化）：先按 §2.3 启动服务，然后浏览器打开
+`http://127.0.0.1:9090/admin`（若设置了 `DOUBAO_API_KEY` 则用 `?key=YOUR_API_KEY`）→
+「登录」Tab → 用豆包 App 扫码；也可直接访问 `http://127.0.0.1:9090/auth` 查看浏览器内的登录页。
+
+方式二（终端取二维码图片）：
 ```bash
-cd C:/Users/29084/Desktop/code/zcodeWorkspace/doubao-proxy
-python main.py login
+# 先按 §2.3 启动服务并保持运行，另开一个终端执行：
+cd doubao2api
+curl -s -X POST http://127.0.0.1:9090/v1/session/qr-login \
+  -H "Authorization: Bearer $DOUBAO_API_KEY" \
+  | python -c "import sys,json,base64; d=json.load(sys.stdin); open('qr.png','wb').write(base64.b64decode(d['qr_image_base64']))"
+# 打开 qr.png，用豆包 App 扫码；然后轮询登录状态
+curl -s http://127.0.0.1:9090/v1/session/qr-login -H "Authorization: Bearer $DOUBAO_API_KEY"
 ```
-弹出 Chrome 窗口，手机号 / 抖音扫码 / 飞书任选，登录完成后自动检测并保存。
+手机号 / 抖音 / 飞书任选，登录后服务会自动注入登录态，无需单独的项目。
 
 ### 2.3 启动服务
 ```bash
-cd C:/Users/29084/Desktop/code/zcodeWorkspace/doubao2api
+cd doubao2api
 bash ./start.sh
 ```
 
@@ -91,17 +102,16 @@ taskkill //PID <PID> //F
 **解决**：不用管，`curl http://127.0.0.1:9090/health` 确认旧服务健康即可；或先按 §3 停掉再启动。
 
 ### 4.2 登录态失效（health 显示 logged_in:false）
-```bash
-cd C:/Users/29084/Desktop/code/zcodeWorkspace/doubao-proxy
-python main.py login        # 重新登录一次
-# 然后重启 doubao2api 服务（§3 停 → §1 起）
-```
+重新扫码登录即可（登录态存在持久化浏览器目录 `DOUBAO_BROWSER_DATA` 里）：
+1. 浏览器打开 `http://127.0.0.1:9090/admin`（或 `/auth`）→「登录」Tab → 扫码；
+2. 或用 §2.2 方式二终端取二维码图片扫码；
+3. 登录成功后无需重启服务，`/health` 会自动变为 `logged_in:true`；异常时再按 §3 停 → §1 起。
 
 ### 4.3 验证码风控（接口返回 710022004 / health 里 needs_captcha:true）
 1. **先降频**：agent 请求间隔 ≥5 秒/次，连发容易触发
 2. **解除验证**：
    ```bash
-   cd C:/Users/29084/Desktop/code/zcodeWorkspace/doubao2api
+   cd doubao2api
    python captcha_fix.py
    # 浏览器弹出后手动通过验证码，窗口保持 60 秒后自动关
    ```
@@ -190,7 +200,7 @@ docker compose down                # 完全移除容器（登录态在卷里，�
 
 ### 6.4 配置改动后生效
 
-改过 `docker-compose.yml`（如换 `DOUBAO_API_KEY`）必须重建：
+改过 `.env` / `docker-compose.yml` 后必须重建（compose 只会在启动时读取 `.env`）：
 ```bash
 docker compose up -d --build
 ```
@@ -200,7 +210,7 @@ docker compose up -d --build
 登录态存容器卷 `./profile`，平时不掉。失效（`logged_in:false`）时：
 ```bash
 cd /opt/doubao2api
-API_KEY=$(grep DOUBAO_API_KEY docker-compose.yml | awk -F'"' '{print $2}')
+API_KEY=$(grep '^DOUBAO_API_KEY=' .env | cut -d= -f2-)
 
 # 1. 生成二维码存成本地图片
 curl -s -X POST http://127.0.0.1:9090/v1/session/qr-login \
