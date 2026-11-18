@@ -9,15 +9,34 @@
 #   - noVNC/websockify on 0.0.0.0:6080  -> http://<host>:6080/vnc.html
 set -eu
 
-if [ "${DOUBAO_ENABLE_VNC:-false}" = "true" ]; then
+start_vnc() {
     echo "[entrypoint] VNC enabled: Xvfb :99 + x11vnc :5900 + noVNC :6080"
+    # A container *restart* (docker compose restart / crash restart) reuses the
+    # filesystem, so the previous Xvfb leaves /tmp/.X99-lock behind. Xvfb then
+    # refuses to start with "Server is already active for display 99" and the
+    # headed browser dies with "Missing X server". Remove stale locks first.
+    rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+
     Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &
+    XVFB_PID=$!
     export DISPLAY=:99
     i=0
-    while [ "$i" -lt 20 ] && [ ! -e /tmp/.X11-unix/X99 ]; do
+    while [ "$i" -lt 50 ]; do
+        if [ -S /tmp/.X11-unix/X99 ]; then
+            break
+        fi
+        if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+            echo "[entrypoint] ERROR: Xvfb exited during startup" >&2
+            exit 1
+        fi
         i=$((i + 1))
         sleep 0.2
     done
+    if [ ! -S /tmp/.X11-unix/X99 ]; then
+        echo "[entrypoint] ERROR: Xvfb failed to create display :99" >&2
+        exit 1
+    fi
+
     if [ -n "${DOUBAO_VNC_PASSWORD:-}" ]; then
         echo "[entrypoint] noVNC/VNC password is enabled"
         x11vnc -display :99 -forever -shared -rfbport 5900 -localhost \
@@ -28,9 +47,12 @@ if [ "${DOUBAO_ENABLE_VNC:-false}" = "true" ]; then
         x11vnc -display :99 -forever -shared -rfbport 5900 -localhost -nopw &
     fi
     websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5900 &
-    log_dir=/root/.cache/ms-playwright
-    mkdir -p "$log_dir"
+
     exec python -m doubao2api
+}
+
+if [ "${DOUBAO_ENABLE_VNC:-false}" = "true" ]; then
+    start_vnc
 fi
 
 exec xvfb-run -a -s "-screen 0 1280x900x24" python -m doubao2api
