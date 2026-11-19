@@ -1055,6 +1055,7 @@ server {
 | `DOUBAO_ALLOW_PRIVATE_FILE_URLS` | `false` | 允许远程 `file_url` 下载内网/私有地址（默认关闭，防 SSRF） |
 | `DOUBAO_FILE_URL_MAX_MB` | `50` | 远程 `file_url` 下载大小上限（MB） |
 | `DOUBAO_RATE_LIMIT_COOLDOWN` | `120` | 上游返回 710022004 限流后本地冷却秒数；期间聊天请求返回 429，避免重试风暴 |
+| `DOUBAO_TOOL_DEEP_THINK` | `3` | 带 `tools` 时使用的模式：`0` 快速 / `1` 思考 / `3` 专家；深度思考/专家有独立额度，agent 高频工具调用建议设 `1` 或 `0` |
 | `QIANWEN_ENABLED` | `false` | 启用千问（Qianwen）上游，提供 `qianwen-*` 模型 |
 | `QIANWEN_HEADLESS` | `true` | 千问浏览器是否无头运行 |
 | `QIANWEN_BROWSER_DATA` | `~/.qianwen_browser` | 千问浏览器持久化用户目录 |
@@ -1286,7 +1287,7 @@ data: [DONE]
 ```
 
 注意：
-- 带 `tools` 时会**强制使用专家模式**（专家额度不足时自动降级为思考模式），响应中的 `model` 仍原样回显请求值；
+- 带 `tools` 时默认使用专家模式，可用 `DOUBAO_TOOL_DEEP_THINK=1`（思考）或 `0`（快速）降低深度思考额度消耗；专家/思考额度不足时会自动降级，响应中的 `model` 仍原样回显请求值。上游返回 710022004 限流时，服务会自动降级模式并重试最多 2 次（等待 10s/20s），仍失败才返回错误并进入本地冷却；
 - `tool_choice` 当前不生效；
 - 附件（`file_url`/`image_url`）不能与 `tools` 同时使用（返回 400）；
 - 模拟调用可靠性不如原生工具调用，适合轻量场景，不建议作为编程智能体主力后端。

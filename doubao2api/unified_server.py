@@ -109,6 +109,13 @@ CORS_ORIGINS = [
 ALLOW_PRIVATE_FILE_URLS = _env_bool("DOUBAO_ALLOW_PRIVATE_FILE_URLS", False)
 FILE_URL_MAX_MB = max(1, _env_int("DOUBAO_FILE_URL_MAX_MB", 50))
 
+# Mode used when the client sends OpenAI tools: 0=quick, 1=think, 3=expert.
+# 深度思考/专家模式有独立的每日额度，额度耗尽会返回 710022004 rate limited；
+# 对工具调用频繁的 agent，可改成 1（think）或 0（quick）以降低触发概率。
+_TOOL_DEEP_THINK = _env_int("DOUBAO_TOOL_DEEP_THINK", 3)
+if _TOOL_DEEP_THINK not in (0, 1, 3):
+    _TOOL_DEEP_THINK = 3
+
 
 def _host_is_private(host: str) -> bool:
     """Resolve a hostname and report whether it points to a non-public address."""
@@ -268,6 +275,25 @@ def _enter_risk_backoff(seconds=None) -> None:
 def _risk_backoff_remaining() -> int:
     """Seconds left in the local risk-control cooldown (0 = clear)."""
     return max(0, int(_risk_backoff_until - time.time()))
+
+
+def _clear_risk_backoff() -> None:
+    """Clear the local cooldown after a successful upstream request."""
+    global _risk_backoff_until
+    _risk_backoff_until = 0.0
+
+
+class _UpstreamRateLimited(Exception):
+    """Internal signal: upstream rate-limited before any output was streamed.
+
+    Raised by ``_stream_chat`` so the retry wrapper can transparently retry
+    with a cheaper mode instead of surfacing a 502 to the client.
+    """
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def _check_risk_backoff() -> None:
@@ -792,12 +818,15 @@ def create_app(
                         status_code=400,
                         detail="File/image attachments are not supported together with tools",
                     )
-                requested_deep_think = CHAT_MODELS["doubao-expert"]
+                requested_deep_think = _TOOL_DEEP_THINK
                 use_deep_think, effective_name = _expert_tracker.get_effective_mode(
                     requested_deep_think
                 )
-                if effective_name != "doubao-expert":
-                    log.info("Expert mode degraded, using %s for tool calling", effective_name)
+                if use_deep_think != requested_deep_think:
+                    log.info(
+                        "Tool-calling mode degraded from %d to %d (%s)",
+                        requested_deep_think, use_deep_think, effective_name,
+                    )
                 messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
                 prompt = convert_messages_with_tools(messages_raw, body.tools)
                 valid_tool_names = _extract_tool_names(body.tools) or None
@@ -836,7 +865,7 @@ def create_app(
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
             return StreamingResponse(
-                _stream_chat(client, prompt, use_deep_think, request_id, model_name,
+                _stream_chat_with_retry(client, prompt, use_deep_think, request_id, model_name,
                              conversation_id=body.conversation_id, bot_id=body.bot_id,
                              has_tools=has_tools,
                              valid_tool_names=valid_tool_names,
@@ -849,7 +878,7 @@ def create_app(
         try:
             if has_tools:
                 # Tool calling non-streaming path
-                message = await _collect_chat_response(
+                message = await _collect_chat_response_with_retry(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                 )
@@ -909,16 +938,13 @@ def create_app(
                     message = {"role": "assistant", "content": result["text"]}
                 finish_reason = "stop"
             else:
-                message = await _collect_chat_response(
+                message = await _collect_chat_response_with_retry(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
             client.record_failure()
-            if _looks_rate_limited(0, str(exc)):
-                _enter_risk_backoff()
-                _expert_tracker.report_rate_limit()
             raise HTTPException(status_code=502, detail=str(exc))
 
         # max_tokens truncation (non-streaming only)
@@ -1693,6 +1719,44 @@ def create_app(
         client.record_success()
         return message
 
+    async def _collect_chat_response_with_retry(
+        client: BrowserClient,
+        prompt: str,
+        use_deep_think: int,
+        *,
+        conversation_id: Optional[str] = None,
+        bot_id: Optional[str] = None,
+    ) -> dict:
+        """Collect a full response, retrying rate-limited requests with cheaper modes.
+
+        Deep-think/expert quota exhaustion surfaces as 710022004 "rate limited".
+        Instead of bouncing a 502 to the client immediately, retry twice with
+        progressively cheaper modes (expert -> think -> quick).
+        """
+        current_mode = use_deep_think
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                return await _collect_chat_response(
+                    client, prompt, current_mode,
+                    conversation_id=conversation_id, bot_id=bot_id,
+                )
+            except RuntimeError as exc:
+                if not _looks_rate_limited(0, str(exc)):
+                    raise
+                last_exc = exc
+                log.warning(
+                    "Upstream rate limited (non-stream attempt %d/3): %s",
+                    attempt, exc,
+                )
+                if attempt >= 3:
+                    _enter_risk_backoff()
+                    raise
+                await asyncio.sleep(10 if attempt == 1 else 20)
+                _expert_tracker.report_rate_limit()
+                current_mode = 1 if current_mode == 3 else 0
+        raise last_exc  # pragma: no cover
+
     async def _stream_chat(
         client: BrowserClient,
         prompt: str,
@@ -1808,10 +1872,11 @@ def create_app(
                     status = event.get("status", 0)
                     body_text = str(event.get("body", ""))[:300]
                     log.error("Upstream stream error (status=%s): %s", status, body_text)
-                    client.record_failure()
+                    client.record_failure(0, body_text)
                     if _looks_rate_limited(status, body_text):
-                        _enter_risk_backoff()
                         _expert_tracker.report_rate_limit()
+                        if not (stream_content_chars or emitted_tool_calls or had_reasoning_content):
+                            raise _UpstreamRateLimited(710022004, body_text)
                     err = {
                         "error": {
                             "message": f"Upstream error (status={status}): {body_text}",
@@ -1838,8 +1903,9 @@ def create_app(
                     log.error("Upstream error event: code=%s msg=%s", code, msg)
                     client.record_failure(code, msg)
                     if _looks_rate_limited(code, msg):
-                        _enter_risk_backoff()
                         _expert_tracker.report_rate_limit()
+                        if not (stream_content_chars or emitted_tool_calls or had_reasoning_content):
+                            raise _UpstreamRateLimited(code, msg)
                     err = {
                         "error": {
                             "message": f"Upstream error code={code}: {msg}",
@@ -2001,6 +2067,65 @@ def create_app(
         }
         yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+
+    async def _stream_chat_with_retry(
+        client: BrowserClient,
+        prompt: str,
+        use_deep_think: int,
+        request_id: str,
+        model: str,
+        *,
+        conversation_id: Optional[str] = None,
+        bot_id: Optional[str] = None,
+        has_tools: bool = False,
+        valid_tool_names: Optional[set[str]] = None,
+        messages_for_counting: Optional[list] = None,
+    ):
+        """Stream a chat response, retrying pre-output rate limits transparently.
+
+        Waits 10s/20s and degrades the mode (expert -> think -> quick) before
+        giving up, so a transient upstream throttle does not surface as an
+        error to the agent. Only when all attempts fail does the local
+        cooldown kick in (subsequent requests get a 429 with Retry-After).
+        """
+        current_mode = use_deep_think
+        for attempt in range(1, 4):
+            try:
+                async for line in _stream_chat(
+                    client, prompt, current_mode, request_id, model,
+                    conversation_id=conversation_id,
+                    bot_id=bot_id,
+                    has_tools=has_tools,
+                    valid_tool_names=valid_tool_names,
+                    messages_for_counting=messages_for_counting,
+                ):
+                    yield line
+                _clear_risk_backoff()
+                return
+            except _UpstreamRateLimited as exc:
+                log.warning(
+                    "Upstream rate limited (stream attempt %d/3, mode=%d): %s",
+                    attempt, current_mode, exc,
+                )
+                if attempt >= 3:
+                    _enter_risk_backoff()
+                    err = {
+                        "error": {
+                            "message": (
+                                "Upstream rate limited after 3 attempts "
+                                f"({exc.message}); please retry later"
+                            ),
+                            "type": "upstream_error",
+                            "code": 502,
+                        }
+                    }
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                await asyncio.sleep(10 if attempt == 1 else 20)
+                _expert_tracker.report_rate_limit()
+                current_mode = 1 if current_mode == 3 else 0
+        return
 
     # ── Admin Dashboard & Auth ──
 
